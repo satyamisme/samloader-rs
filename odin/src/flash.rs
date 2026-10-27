@@ -22,14 +22,14 @@ use crate::firmware::{
 use crate::lp::inspect_super_firmware_info;
 use crate::odin::OdinSession;
 use crate::progress::{self, FlashEvent};
-use futures::io::{AllowStdIo, AsyncRead, AsyncSeek, Cursor};
+use crate::tar::TarArchive;
+use futures::io::{AllowStdIo, AsyncRead, AsyncReadExt, AsyncSeek, Cursor};
 use memmap2::{Mmap, MmapOptions};
 use samloader_pit::{PitData, PitEntry};
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
 use std::path::Path;
-use tar::Archive;
 
 struct IndexedEntry<'a> {
     original_name: String,
@@ -363,7 +363,7 @@ impl<'a> FlashManager<'a> {
 
         // Step 2: Open packages and scan TAR containers to index entries
         let opened_packages = self.open_and_verify_packages().await?;
-        let resolved_entries = self.scan_tar_packages(&opened_packages)?;
+        let resolved_entries = self.scan_tar_packages(&opened_packages).await?;
 
         // Step 3: Flash PIT if available and download active PIT data from the device
         let pit_data = self.download_and_parse_pit().await?;
@@ -428,14 +428,11 @@ impl<'a> FlashManager<'a> {
         }
 
         if !self.skip_md5 {
-            for (pkg, file) in &mut opened_packages {
+            for (pkg, file) in &opened_packages {
                 if pkg.to_lowercase().ends_with(".md5") {
-                    verify_md5_footer(AllowStdIo::new(&*file), pkg)
+                    verify_md5_footer(AllowStdIo::new(file), pkg)
                         .await
                         .map_err(|e| FlashError::Md5VerificationFailed(pkg.clone(), e))?;
-
-                    file.seek(SeekFrom::Start(0))
-                        .map_err(|e| FlashError::FileSeekFailed(pkg.clone(), e))?;
                 }
             }
         }
@@ -444,7 +441,7 @@ impl<'a> FlashManager<'a> {
     }
 
     // Helper 2: Scan TAR packages to find resolved entries and pull package PIT if needed
-    fn scan_tar_packages<'p>(
+    async fn scan_tar_packages<'p>(
         &mut self,
         opened_packages: &'p [(String, File)],
     ) -> Result<Vec<IndexedEntry<'p>>, FlashError> {
@@ -457,21 +454,15 @@ impl<'a> FlashManager<'a> {
         let mut all_packages_entries: Vec<Vec<IndexedEntry<'p>>> = Vec::new();
 
         for (pkg, file) in opened_packages {
-            let mut archive = Archive::new(file);
-            let entries = archive
-                .entries_with_seek()
-                .map_err(|e| FlashError::ArchiveReadFailed(pkg.clone(), e))?;
-
+            let mut archive = TarArchive::new(AllowStdIo::new(file));
             let mut package_entries = Vec::new();
 
-            for entry_res in entries {
-                let entry = entry_res.map_err(|e| FlashError::ArchiveCorrupted(pkg.clone(), e))?;
-
-                let entry_path = match entry.path() {
-                    Ok(p) => p.to_string_lossy().to_string(),
-                    Err(_) => continue,
-                };
-
+            while let Some(mut entry) = archive
+                .next_entry()
+                .await
+                .map_err(|e| FlashError::ArchiveCorrupted(pkg.clone(), e))?
+            {
+                let entry_path = entry.path().to_string();
                 let offset = entry.raw_file_position();
                 let size = entry.size();
 
@@ -479,10 +470,10 @@ impl<'a> FlashManager<'a> {
 
                 if normalized_name == "download-list.txt" {
                     // Read the allowlist manifest
-                    let mut reader = entry;
                     let mut content = String::new();
-                    reader
+                    entry
                         .read_to_string(&mut content)
+                        .await
                         .map_err(|e| FlashError::ArchiveCorrupted(pkg.clone(), e))?;
 
                     self.has_download_list = true;
@@ -499,10 +490,10 @@ impl<'a> FlashManager<'a> {
                         .collect();
                     archives_download_lists.push(download_list);
                 } else if normalized_name == "super_used_size.txt" {
-                    let mut reader = entry;
                     let mut content = String::new();
-                    reader
+                    entry
                         .read_to_string(&mut content)
+                        .await
                         .map_err(|e| FlashError::ArchiveCorrupted(pkg.clone(), e))?;
                     let val = content.trim().parse::<u32>().map_err(|e| {
                         FlashError::ArchiveCorrupted(
@@ -943,7 +934,7 @@ mod tests {
             let opened_packages = vec![(tar_path.to_string_lossy().to_string(), tar_file)];
 
             let mut manager = FlashManager::new(&mut session);
-            let resolved = manager.scan_tar_packages(&opened_packages).unwrap();
+            let resolved = manager.scan_tar_packages(&opened_packages).await.unwrap();
 
             assert_eq!(manager.super_used_size, Some(27276104));
             assert!(manager.has_download_list);
@@ -1071,7 +1062,7 @@ mod tests {
             let opened_packages = vec![(tar_path.to_string_lossy().to_string(), tar_file)];
 
             let mut manager = FlashManager::new(&mut session);
-            let result = manager.scan_tar_packages(&opened_packages);
+            let result = manager.scan_tar_packages(&opened_packages).await;
 
             assert!(matches!(result, Err(FlashError::ArchiveCorrupted(_, _))));
         });

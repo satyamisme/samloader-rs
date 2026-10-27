@@ -31,6 +31,7 @@ mod lp;
 mod odin;
 mod progress;
 mod protocol;
+mod tar;
 mod usb;
 
 pub use device_info::{DeviceInfo, SessionDeviceInfo};

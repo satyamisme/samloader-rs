@@ -225,10 +225,6 @@ pub enum FlashError {
     #[error("Failed to read file \"{0}\": {1}")]
     FileReadFailed(String, #[source] std::io::Error),
 
-    /// Failed to seek within a file.
-    #[error("Failed to seek file \"{0}\": {1}")]
-    FileSeekFailed(String, #[source] std::io::Error),
-
     /// Failed to memory-map a file.
     #[error("Failed to memory map file \"{0}\": {1}")]
     MmapFailed(String, #[source] std::io::Error),
@@ -236,10 +232,6 @@ pub enum FlashError {
     /// Failed to parse an LZ4 frame header.
     #[error("Failed to parse LZ4 header for \"{0}\": {1}")]
     Lz4Header(String, #[source] std::io::Error),
-
-    /// Failed to read entries from a TAR archive.
-    #[error("Failed to read archive entries for \"{0}\": {1}")]
-    ArchiveReadFailed(String, #[source] std::io::Error),
 
     /// The TAR archive contains a corrupted entry.
     #[error("Corrupted archive entry in \"{0}\": {1}")]
