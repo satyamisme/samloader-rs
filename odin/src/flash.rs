@@ -933,7 +933,7 @@ mod tests {
             builder.finish().unwrap();
         }
 
-        pollster::block_on(async {
+        futures::executor::block_on(async {
             let backend = Box::new(MockBackend::new());
             let mut connection = OdinConnection::new(backend);
             connection.init().await.unwrap();
@@ -957,7 +957,7 @@ mod tests {
 
     #[test]
     fn test_flash_partitions_super_size_preflight_success() {
-        pollster::block_on(async {
+        futures::executor::block_on(async {
             let backend = Box::new(MockBackend::new().with_protocol_version(3));
             let mut connection = OdinConnection::new(backend);
             connection.init().await.unwrap();
@@ -981,7 +981,7 @@ mod tests {
 
     #[test]
     fn test_flash_partitions_super_size_preflight_rejection() {
-        pollster::block_on(async {
+        futures::executor::block_on(async {
             let backend = Box::new(
                 MockBackend::new()
                     .with_protocol_version(3)
@@ -1007,7 +1007,7 @@ mod tests {
 
     #[test]
     fn test_flash_partitions_super_size_preflight_skipped_on_legacy_protocol() {
-        pollster::block_on(async {
+        futures::executor::block_on(async {
             // Even if fail_check_super_size is set, legacy protocol version 2 must skip opcode 0x6a
             let backend = Box::new(
                 MockBackend::new()
@@ -1061,7 +1061,7 @@ mod tests {
             builder.finish().unwrap();
         }
 
-        pollster::block_on(async {
+        futures::executor::block_on(async {
             let backend = Box::new(MockBackend::new());
             let mut connection = OdinConnection::new(backend);
             connection.init().await.unwrap();
@@ -1082,7 +1082,7 @@ mod tests {
 
     #[test]
     fn test_download_and_parse_pit_flashes_available_pit() {
-        pollster::block_on(async {
+        futures::executor::block_on(async {
             let backend = Box::new(MockBackend::new());
             let mut connection = OdinConnection::new(backend);
             connection.init().await.unwrap();
@@ -1112,7 +1112,7 @@ mod tests {
     }
 
     fn skipped_names(targets: &[&str]) -> Result<Vec<String>, FlashError> {
-        pollster::block_on(async {
+        futures::executor::block_on(async {
             let pit_data = ab_pit_data();
             let backend = Box::new(MockBackend::new());
             let mut connection = OdinConnection::new(backend);
@@ -1179,7 +1179,7 @@ mod tests {
             temp_dir.join("vbmeta.img").to_string_lossy().into_owned(),
         ));
 
-        pollster::block_on(async {
+        futures::executor::block_on(async {
             let pit_data = ab_pit_data();
             let backend = Box::new(MockBackend::new());
             let mut connection = OdinConnection::new(backend);
@@ -1233,7 +1233,7 @@ mod tests {
         }
 
         let run = |skip: &[&str]| {
-            pollster::block_on(async {
+            futures::executor::block_on(async {
                 let backend = Box::new(
                     MockBackend::with_profile(crate::usb::DeviceProfile::sm_f968b())
                         .with_protocol_version(3)
@@ -1272,7 +1272,8 @@ mod tests {
         let compressed = encoder.finish().unwrap();
         let size = compressed.len() as u64;
         let header =
-            pollster::block_on(Lz4FrameHeader::parse(Cursor::new(&compressed[..]))).unwrap();
+            futures::executor::block_on(Lz4FrameHeader::parse(Cursor::new(&compressed[..])))
+                .unwrap();
         (anon_mapping(&compressed), size, header)
     }
 
@@ -1286,7 +1287,7 @@ mod tests {
         verity: bool,
         verification: bool,
     ) -> Result<(), FlashError> {
-        pollster::block_on(async {
+        futures::executor::block_on(async {
             let backend = Box::new(MockBackend::new());
             let mut connection = OdinConnection::new(backend);
             connection.init().await.unwrap();
@@ -1461,7 +1462,7 @@ mod tests {
         let invalid = write_package("invalid.tar", &[0u8; 4096]);
 
         let run = |tar_path: &Path, verity: bool| {
-            pollster::block_on(async {
+            futures::executor::block_on(async {
                 let backend = Box::new(MockBackend::with_profile(
                     crate::usb::DeviceProfile::sm_f968b(),
                 ));

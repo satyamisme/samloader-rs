@@ -16,8 +16,9 @@
 use crate::flash::CliProgress;
 use crate::print_error;
 use samloader_odin::{
-    OdinConnection, RebootMode, UsbBackendOption, create_backend, detect_device, query_device_info,
-    set_progress, verify_md5_footer,
+    OdinConnection, RebootMode, UsbBackendOption, create_backend, detect_device,
+    futures::{executor::block_on, io::AllowStdIo},
+    query_device_info, set_progress, verify_md5_footer,
 };
 use samloader_pit::PitData;
 use std::fs::File;
@@ -27,7 +28,7 @@ pub(crate) fn action_detect(usb_backend: UsbBackendOption, wait: bool, json: boo
     if !json {
         set_progress(CliProgress::new(false));
     }
-    pollster::block_on(async {
+    block_on(async {
         let detected = detect_device(usb_backend, wait).await;
         if !detected {
             eprintln!("ERROR: Failed to detect compatible download-mode device.");
@@ -78,7 +79,7 @@ pub(crate) fn action_dump_pit(
 
     set_progress(CliProgress::new(verbose));
 
-    pollster::block_on(async {
+    block_on(async {
         // Download PIT file from device.
         let usb = match create_backend(usb_backend, wait).await {
             Ok(u) => u,
@@ -178,7 +179,7 @@ pub(crate) fn action_print_pit(
     } else {
         set_progress(CliProgress::new(verbose));
 
-        pollster::block_on(async {
+        block_on(async {
             let usb = match create_backend(usb_backend, wait).await {
                 Ok(u) => u,
                 Err(e) => {
@@ -253,7 +254,7 @@ pub(crate) fn action_print_pit(
 
 pub(crate) fn action_reboot_download(usb_backend: UsbBackendOption, verbose: bool) -> i32 {
     set_progress(CliProgress::new(verbose));
-    pollster::block_on(async {
+    block_on(async {
         match samloader_odin::reboot_download(usb_backend).await {
             Ok(()) => 0,
             Err(e) => {
@@ -267,7 +268,7 @@ pub(crate) fn action_reboot_download(usb_backend: UsbBackendOption, verbose: boo
 pub(crate) fn action_verify_md5(files: &[String]) -> i32 {
     let mut success = true;
     set_progress(CliProgress::new(false));
-    pollster::block_on(async {
+    block_on(async {
         for file_path in files {
             let file = match File::open(file_path) {
                 Ok(f) => f,
@@ -278,12 +279,7 @@ pub(crate) fn action_verify_md5(files: &[String]) -> i32 {
                 }
             };
 
-            if let Err(e) = verify_md5_footer(
-                samloader_odin::futures::io::AllowStdIo::new(&file),
-                file_path,
-            )
-            .await
-            {
+            if let Err(e) = verify_md5_footer(AllowStdIo::new(&file), file_path).await {
                 print_error!("MD5 verification failed for \"{}\": {}", file_path, e);
                 success = false;
             }

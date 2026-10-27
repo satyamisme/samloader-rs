@@ -19,7 +19,7 @@ use crate::print_error;
 use indicatif::{ProgressBar, ProgressStyle};
 use samloader_odin::{
     FlashEvent, FlashManager, FlashProgress, OdinConnection, RebootMode, UsbBackendOption,
-    create_backend, set_progress,
+    create_backend, futures::executor::block_on, set_progress,
 };
 use std::collections::HashSet;
 use std::fs::File;
@@ -246,7 +246,7 @@ pub(crate) fn action_flash(
 
     set_progress(CliProgress::new(verbose));
 
-    pollster::block_on(async {
+    block_on(async {
         let usb = match create_backend(usb_backend, wait).await {
             Ok(u) => u,
             Err(e) => {

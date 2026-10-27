@@ -752,7 +752,7 @@ mod tests {
 
     #[test]
     fn test_odin_mock_multi_slice_transfer() {
-        pollster::block_on(async {
+        futures::executor::block_on(async {
             let backend = Box::new(MockBackend::new());
             let mut connection = OdinConnection::new(backend);
             assert!(connection.init().await.is_ok());
@@ -796,7 +796,7 @@ mod tests {
 
     #[test]
     fn test_odin_mock_set_sales_code() {
-        pollster::block_on(async {
+        futures::executor::block_on(async {
             let backend = Box::new(MockBackend::new());
             let mut connection = OdinConnection::new(backend);
             assert!(connection.init().await.is_ok());
@@ -885,7 +885,7 @@ mod tests {
 
     #[test]
     fn test_gadget_serial_sends_empty_packets_after_control_requests() {
-        pollster::block_on(async {
+        futures::executor::block_on(async {
             let spy_inner = std::sync::Arc::new(std::sync::Mutex::new(SpyTransferInner::default()));
             let spy = Box::new(SpyTransfer {
                 inner: spy_inner.clone(),
@@ -938,7 +938,7 @@ mod tests {
 
     #[test]
     fn test_non_gadget_serial_skips_empty_packets() {
-        pollster::block_on(async {
+        futures::executor::block_on(async {
             let spy_inner = std::sync::Arc::new(std::sync::Mutex::new(SpyTransferInner::default()));
             let spy = Box::new(SpyTransfer {
                 inner: spy_inner.clone(),
@@ -978,7 +978,7 @@ mod tests {
 
     #[test]
     fn test_receive_response_retry_on_zero_length_packet() {
-        pollster::block_on(async {
+        futures::executor::block_on(async {
             let spy_inner = std::sync::Arc::new(std::sync::Mutex::new(SpyTransferInner::default()));
 
             // Push a 0-length packet first (ZLP), followed by a valid 8-byte response packet
@@ -1017,7 +1017,7 @@ mod tests {
 
     #[test]
     fn test_handshake_recovers_from_queued_fail_response() {
-        pollster::block_on(async {
+        futures::executor::block_on(async {
             let spy_inner = std::sync::Arc::new(std::sync::Mutex::new(SpyTransferInner::default()));
 
             {

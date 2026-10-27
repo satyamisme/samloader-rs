@@ -773,7 +773,7 @@ mod tests {
 
     #[test]
     fn test_sm_f968b_modern_profile_lifecycle() {
-        pollster::block_on(async {
+        futures::executor::block_on(async {
             let profile = DeviceProfile::sm_f968b();
             let backend = Box::new(MockBackend::with_profile(profile));
             let mut connection = OdinConnection::new(backend);
@@ -815,7 +815,7 @@ mod tests {
 
     #[test]
     fn test_gt_i9305_legacy_profile_lifecycle() {
-        pollster::block_on(async {
+        futures::executor::block_on(async {
             let profile = DeviceProfile::gt_i9305();
             assert_eq!(profile.model, "GT-I9305");
             assert_eq!(profile.cpu_bl_id, "Mx-MDM");

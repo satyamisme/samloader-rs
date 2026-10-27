@@ -584,7 +584,7 @@ mod tests {
 
         let progress = TestProgress::new();
         crate::progress::set_progress(progress.clone());
-        let res = pollster::block_on(verify_md5_footer(Cursor::new(&data), "test.tar"));
+        let res = futures::executor::block_on(verify_md5_footer(Cursor::new(&data), "test.tar"));
         crate::progress::clear_progress();
 
         assert!(res.is_ok());
@@ -615,7 +615,7 @@ mod tests {
 
         let progress = TestProgress::new();
         crate::progress::set_progress(progress.clone());
-        let res = pollster::block_on(verify_md5_footer(Cursor::new(&data), "test.tar"));
+        let res = futures::executor::block_on(verify_md5_footer(Cursor::new(&data), "test.tar"));
         crate::progress::clear_progress();
 
         assert!(res.is_err());
@@ -656,7 +656,7 @@ mod tests {
             fota_filename: Default::default(),
         };
 
-        pollster::block_on(async {
+        futures::executor::block_on(async {
             let mut cursor = futures::io::Cursor::new(compressed.as_slice());
             let header = Lz4FrameHeader::parse(&mut cursor).await.unwrap();
             assert_eq!(header.content_size, original.len() as u64);
