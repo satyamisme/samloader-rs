@@ -247,6 +247,13 @@ pub(crate) struct FlashArgs {
     pub(crate) force: bool,
 }
 
+// Opens a file for reading by the async flashing pipeline
+fn open(path: &str) -> Result<AllowStdIo<File>, String> {
+    File::open(path)
+        .map(AllowStdIo::new)
+        .map_err(|e| format!("Failed to open file \"{}\": {}", path, e))
+}
+
 pub(crate) fn action_flash(args: FlashArgs) -> i32 {
     match flash(args) {
         Ok(()) => 0,
@@ -277,12 +284,10 @@ fn flash(args: FlashArgs) -> Result<(), Box<dyn Error>> {
     } = args;
 
     if !force {
-        let mut check_packages = Vec::with_capacity(packages.len());
-        for pkg in &packages {
-            let file =
-                File::open(pkg).map_err(|e| format!("Failed to open file \"{}\": {}", pkg, e))?;
-            check_packages.push((pkg.clone(), AllowStdIo::new(file)));
-        }
+        let mut check_packages = packages
+            .iter()
+            .map(|pkg| Ok((pkg.clone(), open(pkg)?)))
+            .collect::<Result<Vec<_>, String>>()?;
 
         let package_files = block_on(package_flash_files(&mut check_packages))?;
 
@@ -301,19 +306,15 @@ fn flash(args: FlashArgs) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let mut opened_packages = Vec::with_capacity(packages.len());
-    for pkg in &packages {
-        let file =
-            File::open(pkg).map_err(|e| format!("Failed to open file \"{}\": {}", pkg, e))?;
-        opened_packages.push((pkg.as_str(), AllowStdIo::new(file)));
-    }
+    let opened_packages = packages
+        .iter()
+        .map(|pkg| Ok((pkg.as_str(), open(pkg)?)))
+        .collect::<Result<Vec<_>, String>>()?;
 
-    let mut opened_partitions = Vec::with_capacity(partitions.len());
-    for p in &partitions {
-        let file = File::open(&p.filename)
-            .map_err(|e| format!("Failed to open file \"{}\": {}", p.filename, e))?;
-        opened_partitions.push((p.name.clone(), p.filename.as_str(), AllowStdIo::new(file)));
-    }
+    let opened_partitions = partitions
+        .iter()
+        .map(|p| Ok((p.name.clone(), p.filename.as_str(), open(&p.filename)?)))
+        .collect::<Result<Vec<_>, String>>()?;
 
     let pit_bytes = match pit {
         Some(pit_path) => Some(
