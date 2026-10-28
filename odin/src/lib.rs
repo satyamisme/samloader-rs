@@ -45,7 +45,7 @@ pub use usb::{
 };
 
 #[cfg(target_arch = "wasm32")]
-pub use usb::request_device;
+pub use usb::{request_device, request_reboot_device};
 
 #[cfg(feature = "nusb")]
 pub use usb::NusbBackend;

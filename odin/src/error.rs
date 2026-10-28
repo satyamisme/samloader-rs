@@ -23,6 +23,10 @@ pub enum OdinError {
     #[error("Failed to detect compatible download-mode device.")]
     DeviceNotFound,
 
+    /// Failed to detect a Samsung device in normal (non-download) mode.
+    #[error("Failed to detect Samsung device in normal mode.")]
+    NormalModeDeviceNotFound,
+
     /// Failed to access the USB device.
     #[cfg(target_os = "linux")]
     #[error(

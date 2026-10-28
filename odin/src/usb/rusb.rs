@@ -74,28 +74,8 @@ impl UsbBackend for RusbBackend {
     type UsbDevice = ::rusb::Device<Context>;
 
     async fn new(device: Self::UsbDevice) -> Result<Self, OdinError> {
-        let handle = match device.open() {
-            Ok(h) => h,
-            Err(e) => return Err(OdinError::DeviceAccess(Box::new(e))),
-        };
-
-        if let Ok(config) = handle.active_configuration() {
-            if config != 1 {
-                let _ = handle.set_active_configuration(1);
-            }
-        } else {
-            let _ = handle.set_active_configuration(1);
-        }
-
-        if crate::progress::is_verbose() {
-            Self::print_device_info(&device, &handle);
-        }
-
-        let product = device
-            .device_descriptor()
-            .ok()
-            .and_then(|desc| handle.read_product_string_ascii(&desc).ok());
-
+        // Locate the CDC data interface from cached descriptors before opening the
+        // device, so unrelated devices are never opened or reconfigured.
         let config_descriptor = device
             .config_descriptor(0)
             .map_err(|_| OdinError::ConfigDescriptorRetrieval)?;
@@ -135,6 +115,28 @@ impl UsbBackend for RusbBackend {
         if interface_index < 0 {
             return Err(OdinError::InterfaceConfigurationNotFound);
         }
+
+        let handle = match device.open() {
+            Ok(h) => h,
+            Err(e) => return Err(OdinError::DeviceAccess(Box::new(e))),
+        };
+
+        if let Ok(config) = handle.active_configuration() {
+            if config != 1 {
+                let _ = handle.set_active_configuration(1);
+            }
+        } else {
+            let _ = handle.set_active_configuration(1);
+        }
+
+        if crate::progress::is_verbose() {
+            Self::print_device_info(&device, &handle);
+        }
+
+        let product = device
+            .device_descriptor()
+            .ok()
+            .and_then(|desc| handle.read_product_string_ascii(&desc).ok());
 
         print_verbose!("Claiming interface...");
         if handle.claim_interface(interface_index as u8).is_err() {

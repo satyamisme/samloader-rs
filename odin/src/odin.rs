@@ -693,34 +693,29 @@ impl OdinSession {
 
 /// Triggers a reboot of the connected Samsung device into Download Mode via the
 /// specified backend protocol.
+///
+/// The AT command is sent to the first Samsung device not already in Download
+/// Mode that exposes a usable interface; unrelated Samsung USB devices are
+/// skipped. If no such device can be opened but one is already in Download
+/// Mode, this is a no-op.
+///
+/// On WASM, the device must first be paired with `request_reboot_device`.
 pub async fn reboot_download(usb_backend: crate::usb::UsbBackendOption) -> Result<(), OdinError> {
-    use crate::usb::UsbTransfer;
-
-    let mut backend: Box<dyn UsbTransfer> = match usb_backend {
-        #[cfg(feature = "serialport")]
-        crate::usb::UsbBackendOption::Vcom => {
-            use crate::usb::{SerialBackend, UsbBackend, VID_SAMSUNG};
-            let device = SerialBackend::find_device(|vid, _| vid == VID_SAMSUNG).await?;
-            Ok::<Box<dyn UsbTransfer>, OdinError>(Box::new(SerialBackend::new(device).await?))
+    let mut backend = match usb_backend.create_normal_mode_transfer().await {
+        Ok(backend) => backend,
+        Err(e) => {
+            // The error may come from an unrelated device of the same vendor,
+            // so check for a device already in Download Mode before reporting it.
+            if usb_backend.check_device().await.is_ok() {
+                if !matches!(e, OdinError::NormalModeDeviceNotFound) {
+                    crate::progress::println_verbose(&format!("Ignoring error: {e}"));
+                }
+                crate::progress::println("Device is already in Download Mode.");
+                return Ok(());
+            }
+            return Err(e);
         }
-        #[cfg(feature = "nusb")]
-        crate::usb::UsbBackendOption::Nusb => {
-            use crate::usb::{NusbBackend, UsbBackend, VID_SAMSUNG};
-            let device = NusbBackend::find_device(|vid, _| vid == VID_SAMSUNG).await?;
-            Ok::<Box<dyn UsbTransfer>, OdinError>(Box::new(NusbBackend::new(device).await?))
-        }
-        #[cfg(feature = "rusb")]
-        crate::usb::UsbBackendOption::Libusb => {
-            use crate::usb::{RusbBackend, UsbBackend, VID_SAMSUNG};
-            let device = RusbBackend::find_device(|vid, _| vid == VID_SAMSUNG).await?;
-            Ok::<Box<dyn UsbTransfer>, OdinError>(Box::new(RusbBackend::new(device).await?))
-        }
-        #[cfg(any(feature = "mock", debug_assertions))]
-        crate::usb::UsbBackendOption::Mock => {
-            use crate::usb::MockBackend;
-            Ok::<Box<dyn UsbTransfer>, OdinError>(Box::new(MockBackend::new()))
-        }
-    }?;
+    };
 
     let cmd: &[u8] = b"AT+SUDDLMOD=0,0\r";
 

@@ -45,7 +45,7 @@ const ENABLED_BACKENDS: &[&str] = &[
     UsbBackendOption::Libusb.to_str(),
     #[cfg(feature = "serialport")]
     UsbBackendOption::Vcom.to_str(),
-    #[cfg(any(feature = "mock", debug_assertions))]
+    #[cfg(mock_backend)]
     UsbBackendOption::Mock.to_str(),
 ];
 
