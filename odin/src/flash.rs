@@ -194,6 +194,31 @@ pub async fn package_flash_files<R: AsyncRead + AsyncSeek + Unpin>(
         .collect())
 }
 
+/// Returns whether flashing `names` would write the userdata partition, which
+/// wipes the device's data.
+///
+/// Each name is either a file name, such as those returned by
+/// [`package_flash_files`], or a partition name. Directories and `.lz4` suffixes
+/// are stripped. `skip` takes the same targets as [`FlashManager::skip`].
+///
+/// As the device's PIT is not consulted, this is a name-based check meant for
+/// confirmation prompts before connecting to a device. Partitions given by
+/// numeric ID cannot be resolved.
+pub fn flashes_userdata(names: &[impl AsRef<str>], skip: &[impl AsRef<str>]) -> bool {
+    let is_skipped = |name: &str| {
+        skip.iter().any(|target| {
+            let target = target.as_ref().trim();
+            target.eq_ignore_ascii_case("USERDATA")
+                || normalize_basename(target).0.eq_ignore_ascii_case(name)
+        })
+    };
+
+    names.iter().any(|name| {
+        let (name, _) = normalize_basename(name.as_ref());
+        name.to_ascii_lowercase().starts_with("userdata") && !is_skipped(&name)
+    })
+}
+
 fn normalize_basename(path_str: &str) -> (String, bool) {
     let mut filename = Path::new(path_str)
         .file_name()
@@ -958,6 +983,29 @@ mod tests {
     use super::*;
     use crate::odin::OdinConnection;
     use crate::usb::{MockBackend, MockEvent};
+
+    #[test]
+    fn test_flashes_userdata() {
+        let none: &[&str] = &[];
+
+        // File names, ignoring directories and the .lz4 suffix, and partition names
+        assert!(flashes_userdata(&["boot.img", "userdata.img"], none));
+        assert!(flashes_userdata(&["dir/userdata.img.lz4"], none));
+        assert!(flashes_userdata(&["USERDATA"], none));
+        assert!(!flashes_userdata(&["boot.img", "super.img"], none));
+        assert!(!flashes_userdata(none, none));
+
+        // Skipped by partition name in any case, or by file name
+        assert!(!flashes_userdata(&["userdata.img"], &["userdata"]));
+        assert!(!flashes_userdata(&["USERDATA"], &[" USERDATA "]));
+        assert!(!flashes_userdata(
+            &["userdata.img"],
+            &["out/userdata.img.lz4"]
+        ));
+
+        // Skipping other partitions does not exclude userdata
+        assert!(flashes_userdata(&["userdata.img"], &["boot", "super.img"]));
+    }
 
     fn build_tar(files: &[(&str, &[u8])]) -> Vec<u8> {
         let mut builder = tar::Builder::new(Vec::new());

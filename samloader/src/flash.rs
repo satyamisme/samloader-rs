@@ -19,14 +19,13 @@ use crate::print_error;
 use indicatif::{ProgressBar, ProgressStyle};
 use samloader_odin::{
     FlashEvent, FlashManager, FlashProgress, OdinConnection, RebootMode, UsbBackendOption,
-    create_backend,
+    create_backend, flashes_userdata,
     futures::{executor::block_on, io::AllowStdIo},
     package_flash_files, set_progress,
 };
 use std::error::Error;
 use std::fs::File;
 use std::io::{self, BufRead, IsTerminal, Write};
-use std::path::Path;
 use std::time::Duration;
 
 const PROGRESS_TEMPLATE: &str =
@@ -140,46 +139,6 @@ impl FlashProgress for CliProgress {
     }
 }
 
-// Strips any directory and .lz4 suffix, like the partition matching done when flashing
-fn normalize_basename(path: &str) -> String {
-    let name = Path::new(path)
-        .file_name()
-        .map(|f| f.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    match name.len().checked_sub(4) {
-        Some(stem) if name[stem..].eq_ignore_ascii_case(".lz4") => name[..stem].to_string(),
-        _ => name,
-    }
-}
-
-// Checks whether userdata is flashed before talking to the device, so without its PIT.
-// Packages and auto-matched files are checked by file name, and explicit partitions by
-// partition name. Partitions given by numeric ID cannot be resolved and are not checked.
-fn flashes_userdata(
-    package_files: &[String],
-    partitions: &[PartitionArg],
-    skip: &[String],
-) -> bool {
-    let is_skipped = |name: &str| {
-        skip.iter().any(|target| {
-            let target = target.trim();
-            target.eq_ignore_ascii_case("USERDATA")
-                || normalize_basename(target).eq_ignore_ascii_case(name)
-        })
-    };
-
-    let mut names = package_files.to_vec();
-    for part in partitions {
-        names.push(match &part.name {
-            Some(name) => name.clone(),
-            None => normalize_basename(&part.filename),
-        });
-    }
-    names
-        .iter()
-        .any(|name| name.to_ascii_lowercase().starts_with("userdata") && !is_skipped(name))
-}
-
 // Asks a y/n question on the terminal, declining when stdin is closed
 fn confirm(question: &str) -> bool {
     let mut stdin = io::stdin().lock();
@@ -291,7 +250,17 @@ fn flash(args: FlashArgs) -> Result<(), Box<dyn Error>> {
     if !force {
         let package_files = block_on(package_flash_files(&mut opened_packages))?;
 
-        if flashes_userdata(&package_files, &partitions, &skip) {
+        let names: Vec<&str> = package_files
+            .iter()
+            .map(String::as_str)
+            .chain(
+                partitions
+                    .iter()
+                    .map(|p| p.name.as_deref().unwrap_or(&p.filename)),
+            )
+            .collect();
+
+        if flashes_userdata(&names, &skip) {
             if !io::stdin().is_terminal() {
                 return Err(
                     "Flash list contains userdata, which will wipe the device's data. \
