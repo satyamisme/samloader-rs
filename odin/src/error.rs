@@ -17,6 +17,7 @@ use thiserror::Error;
 
 /// Represents all errors that can occur during communication with Samsung devices using the Odin protocol.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum OdinError {
     /// Failed to detect a compatible download-mode device.
     #[error("Failed to detect compatible download-mode device.")]
@@ -212,6 +213,7 @@ impl LokeError {
 
 /// Represents errors that can occur during the high-level flashing process.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum FlashError {
     /// An error originating from the low-level Odin protocol client.
     #[error("Odin error: {0}")]

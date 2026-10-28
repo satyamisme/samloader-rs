@@ -694,24 +694,24 @@ impl OdinSession {
 /// Triggers a reboot of the connected Samsung device into Download Mode via the
 /// specified backend protocol.
 pub async fn reboot_download(usb_backend: crate::usb::UsbBackendOption) -> Result<(), OdinError> {
-    use crate::usb::{UsbTransfer, VID_SAMSUNG};
+    use crate::usb::UsbTransfer;
 
     let mut backend: Box<dyn UsbTransfer> = match usb_backend {
         #[cfg(feature = "serialport")]
         crate::usb::UsbBackendOption::Vcom => {
-            use crate::usb::{SerialBackend, UsbBackend};
+            use crate::usb::{SerialBackend, UsbBackend, VID_SAMSUNG};
             let device = SerialBackend::find_device(|vid, _| vid == VID_SAMSUNG).await?;
             Ok::<Box<dyn UsbTransfer>, OdinError>(Box::new(SerialBackend::new(device).await?))
         }
         #[cfg(feature = "nusb")]
         crate::usb::UsbBackendOption::Nusb => {
-            use crate::usb::{NusbBackend, UsbBackend};
+            use crate::usb::{NusbBackend, UsbBackend, VID_SAMSUNG};
             let device = NusbBackend::find_device(|vid, _| vid == VID_SAMSUNG).await?;
             Ok::<Box<dyn UsbTransfer>, OdinError>(Box::new(NusbBackend::new(device).await?))
         }
         #[cfg(feature = "rusb")]
         crate::usb::UsbBackendOption::Libusb => {
-            use crate::usb::{RusbBackend, UsbBackend};
+            use crate::usb::{RusbBackend, UsbBackend, VID_SAMSUNG};
             let device = RusbBackend::find_device(|vid, _| vid == VID_SAMSUNG).await?;
             Ok::<Box<dyn UsbTransfer>, OdinError>(Box::new(RusbBackend::new(device).await?))
         }

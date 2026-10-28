@@ -65,3 +65,7 @@ pub use rusb;
 pub use samloader_pit;
 #[cfg(feature = "serialport")]
 pub use serialport;
+
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;

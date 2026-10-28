@@ -16,28 +16,32 @@ This crate manages communication with Samsung devices in Download Mode (Odin pro
 
 ### Establishing a Session with a Connected Device
 
-```rust
-use samloader_odin::{OdinConnection, UsbBackendOption, create_backend};
+```rust,no_run
+use samloader_odin::{
+    OdinConnection, UsbBackendOption, create_backend, futures::executor::block_on,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Establish the USB/VCOM backend connection
-    let usb = create_backend(UsbBackendOption::Nusb, true)?;
-    let mut connection = OdinConnection::new(usb);
+    block_on(async {
+        // 1. Establish the USB/VCOM backend connection
+        let usb = create_backend(UsbBackendOption::Nusb, true).await?;
+        let mut connection = OdinConnection::new(usb);
 
-    // 2. Run the Loke protocol handshake (simple string in/out)
-    connection.init()?;
-    
-    // 3. Negotiate features and initialize an active packet session
-    let mut session = connection.begin_session()?;
+        // 2. Run the Loke protocol handshake (simple string in/out)
+        connection.init().await?;
 
-    // 4. Download and print the device's PIT layout (packet I/O)
-    let pit_bytes = session.receive_pit_info()?;
-    println!("PIT downloaded successfully ({} bytes).", pit_bytes.len());
+        // 3. Negotiate features and initialize an active packet session
+        let mut session = connection.begin_session().await?;
 
-    // 5. Safely end the session
-    session.end_session()?;
+        // 4. Download and print the device's PIT layout (packet I/O)
+        let pit_bytes = session.receive_pit_info().await?;
+        println!("PIT downloaded successfully ({} bytes).", pit_bytes.len());
 
-    Ok(())
+        // 5. Safely end the session
+        session.end_session().await?;
+
+        Ok(())
+    })
 }
 ```
 
