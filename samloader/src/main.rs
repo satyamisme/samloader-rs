@@ -21,6 +21,7 @@ mod actions;
 mod download;
 mod flash;
 
+use clap::builder::PossibleValuesParser;
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use samloader_fus::{FusClient, fetch_version_xml};
 use samloader_odin::{RebootMode, UsbBackendOption};
@@ -38,17 +39,6 @@ macro_rules! print_error {
     };
 }
 
-const ENABLED_BACKENDS: &[&str] = &[
-    #[cfg(feature = "nusb")]
-    UsbBackendOption::Nusb.to_str(),
-    #[cfg(feature = "rusb")]
-    UsbBackendOption::Libusb.to_str(),
-    #[cfg(feature = "serialport")]
-    UsbBackendOption::Vcom.to_str(),
-    #[cfg(mock_backend)]
-    UsbBackendOption::Mock.to_str(),
-];
-
 // On Windows, the default USB backend is set to VCOM rather than libusb/nusb.
 // This is because libusb/nusb requires replacing the standard device driver
 // with a WinUSB/generic driver (e.g., using a utility like Zadig).
@@ -61,7 +51,7 @@ cfg_if::cfg_if! {
     if #[cfg(all(target_os = "windows", feature = "serialport"))] {
         const DEFAULT_BACKEND: &str = UsbBackendOption::Vcom.to_str();
     } else {
-        const DEFAULT_BACKEND: &str = ENABLED_BACKENDS.first().unwrap();
+        const DEFAULT_BACKEND: &str = UsbBackendOption::ALL[0].to_str();
     }
 }
 
@@ -225,7 +215,9 @@ fn main() {
                 .long("usb-backend")
                 .global(true)
                 .default_value(DEFAULT_BACKEND)
-                .value_parser(ENABLED_BACKENDS.to_vec())
+                .value_parser(PossibleValuesParser::new(
+                    UsbBackendOption::ALL.iter().map(|b| b.to_str()),
+                ))
                 .help(USB_BACKEND_HELP),
         )
         .subcommand(

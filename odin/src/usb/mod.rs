@@ -255,6 +255,18 @@ impl std::str::FromStr for UsbBackendOption {
 }
 
 impl UsbBackendOption {
+    /// All backend options enabled in this build, in order of preference.
+    pub const ALL: &'static [UsbBackendOption] = &[
+        #[cfg(feature = "nusb")]
+        UsbBackendOption::Nusb,
+        #[cfg(feature = "rusb")]
+        UsbBackendOption::Libusb,
+        #[cfg(feature = "serialport")]
+        UsbBackendOption::Vcom,
+        #[cfg(mock_backend)]
+        UsbBackendOption::Mock,
+    ];
+
     /// Returns the string representation of the backend option.
     pub const fn to_str(self) -> &'static str {
         match self {
@@ -497,6 +509,15 @@ mod tests {
             DEVICES
                 .with_borrow(|d| d.iter().copied().find(|&(vid, pid, _)| predicate(vid, pid)))
                 .ok_or(OdinError::DeviceNotFound)
+        }
+    }
+
+    #[test]
+    fn test_all_backends_round_trip() {
+        assert!(!UsbBackendOption::ALL.is_empty());
+        for backend in UsbBackendOption::ALL {
+            let parsed = UsbBackendOption::try_from(backend.to_str()).unwrap();
+            assert_eq!(parsed.to_str(), backend.to_str());
         }
     }
 

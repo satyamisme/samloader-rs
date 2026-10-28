@@ -40,7 +40,6 @@ fn main() {
         "real_backend",
         has_feature("nusb") || has_feature("rusb") || has_feature("serialport"),
     );
-    // The mock backend is always available in debug builds. Must match the
-    // definition in samloader's build script.
+    // The mock backend is always available in debug builds.
     cfg_alias("mock_backend", has_feature("mock") || debug_build);
 }
