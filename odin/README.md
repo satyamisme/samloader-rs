@@ -45,6 +45,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+## WebAssembly
+
+The `nusb` backend supports `wasm32-unknown-unknown` in browsers with [WebUSB](https://wicg.github.io/webusb/) support (Chromium-based browsers). The `rusb` and `serialport` backends are not available on WebAssembly.
+
+`web-sys` considers its WebUSB bindings unstable and [requires the root crate to opt in](https://wasm-bindgen.github.io/wasm-bindgen/web-sys/unstable-apis.html). This flag is not inherited from dependencies, so put the following in the `.cargo/config.toml` of the project building the final WebAssembly binary, otherwise `nusb` fails to compile:
+
+```toml
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg=web_sys_unstable_apis"]
+```
+
+Browsers only expose USB devices the user has granted access to. Before connecting, call `request_device` (or `request_reboot_device` before `reboot_download`) from a user gesture such as a click handler to prompt for permission.
+
 ## License
 
 This project is licensed under the Apache License, Version 2.0. The core flashing logic is a derivative work of [Grimler/Heimdall](https://git.sr.ht/~grimler/Heimdall) licensed under the MIT License.
