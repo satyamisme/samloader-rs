@@ -87,7 +87,9 @@ impl UsbBackend for RusbBackend {
             let _ = handle.set_active_configuration(1);
         }
 
-        Self::print_device_info(&device, &handle);
+        if crate::progress::is_verbose() {
+            Self::print_device_info(&device, &handle);
+        }
 
         let product = device
             .device_descriptor()

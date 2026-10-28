@@ -72,6 +72,20 @@ impl FlashProgress for CliProgress {
         }
     }
 
+    fn is_verbose(&self) -> bool {
+        self.verbose
+    }
+
+    fn eprintln_verbose(&self, msg: &str) {
+        if !self.verbose {
+            return;
+        }
+        match &*self.progress_bar.lock().unwrap() {
+            Some(pb) => pb.suspend(|| eprintln!("{}", msg)),
+            None => eprintln!("{}", msg),
+        }
+    }
+
     fn on_event(&self, event: FlashEvent<'_>) {
         match event {
             FlashEvent::PartitionStart { name, size } => {

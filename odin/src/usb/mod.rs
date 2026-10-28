@@ -34,14 +34,14 @@ use std::io::{Read, Write};
 #[allow(unused_macros)]
 macro_rules! print_warning {
     ($($arg:tt)*) => {
-        crate::progress::println_verbose(&format!("WARNING: {}", format_args!($($arg)*)));
+        crate::progress::eprintln_verbose(&format!("WARNING: {}", format_args!($($arg)*)));
     };
 }
 
 #[allow(unused_macros)]
 macro_rules! print_verbose {
     ($($arg:tt)*) => {
-        crate::progress::println_verbose(&format!($($arg)*));
+        crate::progress::eprintln_verbose(&format!($($arg)*));
     };
 }
 

@@ -53,6 +53,18 @@ pub trait FlashProgress: Send + Sync {
     /// Prints a verbose log or status message (implementation decides if it is shown).
     fn println_verbose(&self, _msg: &str) {}
 
+    /// Returns whether verbose messages are shown. Used to skip collecting
+    /// diagnostics that are expensive to obtain (e.g. USB string descriptors).
+    fn is_verbose(&self) -> bool {
+        false
+    }
+
+    /// Prints a verbose diagnostic message from the USB transport layer.
+    /// Defaults to [`println_verbose`](Self::println_verbose).
+    fn eprintln_verbose(&self, msg: &str) {
+        self.println_verbose(msg);
+    }
+
     /// Handles a flashing or verification lifecycle event.
     fn on_event(&self, _event: FlashEvent<'_>) {}
 }
@@ -103,6 +115,17 @@ pub(crate) fn println(msg: &str) {
 /// Prints a verbose message through the active progress reporter.
 pub(crate) fn println_verbose(msg: &str) {
     with_progress(|p| p.println_verbose(msg));
+}
+
+/// Returns whether verbose messages are shown through the active progress reporter.
+#[cfg(feature = "rusb")]
+pub(crate) fn is_verbose() -> bool {
+    with_progress(|p| p.is_verbose())
+}
+
+/// Prints a verbose diagnostic message from the USB transport layer through the active progress reporter.
+pub(crate) fn eprintln_verbose(msg: &str) {
+    with_progress(|p| p.eprintln_verbose(msg));
 }
 
 /// Dispatches a flashing lifecycle event through the active progress reporter.
