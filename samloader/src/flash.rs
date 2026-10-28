@@ -283,13 +283,13 @@ fn flash(args: FlashArgs) -> Result<(), Box<dyn Error>> {
         force,
     } = args;
 
-    if !force {
-        let mut check_packages = packages
-            .iter()
-            .map(|pkg| Ok((pkg.clone(), open(pkg)?)))
-            .collect::<Result<Vec<_>, String>>()?;
+    let mut opened_packages = packages
+        .iter()
+        .map(|pkg| Ok((pkg.clone(), open(pkg)?)))
+        .collect::<Result<Vec<_>, String>>()?;
 
-        let package_files = block_on(package_flash_files(&mut check_packages))?;
+    if !force {
+        let package_files = block_on(package_flash_files(&mut opened_packages))?;
 
         if flashes_userdata(&package_files, &partitions, &skip) {
             if !io::stdin().is_terminal() {
@@ -305,11 +305,6 @@ fn flash(args: FlashArgs) -> Result<(), Box<dyn Error>> {
             }
         }
     }
-
-    let opened_packages = packages
-        .iter()
-        .map(|pkg| Ok((pkg.as_str(), open(pkg)?)))
-        .collect::<Result<Vec<_>, String>>()?;
 
     let opened_partitions = partitions
         .iter()

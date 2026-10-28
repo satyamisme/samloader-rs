@@ -180,6 +180,9 @@ async fn scan_packages<R: AsyncRead + AsyncSeek + Unpin>(
 /// considered for flashing from `packages`, honoring `download-list.txt`.
 /// Metadata files and PIT files are excluded. Useful for confirmation prompts
 /// before connecting to a device.
+///
+/// Readers are only accessed through absolute seeks, so they can be passed to
+/// [`FlashManager::packages`] afterwards without rewinding.
 pub async fn package_flash_files<R: AsyncRead + AsyncSeek + Unpin>(
     packages: &mut [(String, R)],
 ) -> Result<Vec<String>, FlashError> {
