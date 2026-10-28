@@ -621,24 +621,24 @@ fn main() {
                 .map(|v| v.cloned().collect())
                 .unwrap_or_default();
 
-            let result = flash::action_flash(
+            let args = flash::FlashArgs {
                 usb_backend,
                 verbose,
-                get_reboot_mode(sub_matches),
-                sub_matches.get_flag("wait"),
-                sub_matches.get_flag("skip-size-check"),
-                sub_matches.get_flag("skip-md5"),
-                pit,
-                &packages,
-                &partitions,
-                &skip,
-                sub_matches.get_flag("disable-verity"),
-                sub_matches.get_flag("disable-verification"),
-                csc_code,
+                reboot_mode: get_reboot_mode(sub_matches),
+                wait: sub_matches.get_flag("wait"),
+                skip_size_check: sub_matches.get_flag("skip-size-check"),
+                skip_md5: sub_matches.get_flag("skip-md5"),
+                pit: pit.map(str::to_string),
+                packages,
+                partitions,
+                skip,
+                disable_verity: sub_matches.get_flag("disable-verity"),
+                disable_verification: sub_matches.get_flag("disable-verification"),
+                csc_code: csc_code.map(str::to_string),
                 erase,
-                sub_matches.get_flag("force"),
-            );
-            std::process::exit(result);
+                force: sub_matches.get_flag("force"),
+            };
+            std::process::exit(flash::action_flash(args));
         }
         Some(("verify-md5", sub_matches)) => {
             let files: Vec<String> = sub_matches

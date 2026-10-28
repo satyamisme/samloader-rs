@@ -199,27 +199,75 @@ fn confirm(question: &str) -> bool {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn action_flash(
-    usb_backend: UsbBackendOption,
-    verbose: bool,
-    reboot_mode: RebootMode,
-    wait: bool,
-    skip_size_check: bool,
-    skip_md5: bool,
-    pit: Option<&str>,
-    packages: &[String],
-    partitions: &[PartitionArg],
-    skip: &[String],
-    disable_verity: bool,
-    disable_verification: bool,
-    csc_code: Option<&str>,
-    erase: bool,
-    force: bool,
-) -> i32 {
+pub(crate) struct FlashArgs {
+    /// The USB backend used to communicate with the device
+    pub(crate) usb_backend: UsbBackendOption,
+
+    /// Whether to enable verbose output
+    pub(crate) verbose: bool,
+
+    /// How the device reboots after flashing
+    pub(crate) reboot_mode: RebootMode,
+
+    /// Wait until a compatible device is connected
+    pub(crate) wait: bool,
+
+    /// Do not verify that files fit in their partitions
+    pub(crate) skip_size_check: bool,
+
+    /// Skip MD5 checksum verification of packages
+    pub(crate) skip_md5: bool,
+
+    /// Optional: the PIT file to flash to the device
+    pub(crate) pit: Option<String>,
+
+    /// TAR packages to flash
+    pub(crate) packages: Vec<String>,
+
+    /// Individual partition images to flash
+    pub(crate) partitions: Vec<PartitionArg>,
+
+    /// File or partition names to exclude from flashing
+    pub(crate) skip: Vec<String>,
+
+    /// Set disable-verity when flashing vbmeta
+    pub(crate) disable_verity: bool,
+
+    /// Set disable-verification when flashing vbmeta
+    pub(crate) disable_verification: bool,
+
+    /// Optional: CSC code to set on the device
+    pub(crate) csc_code: Option<String>,
+
+    /// Perform a NAND erase on USERDATA before flashing
+    pub(crate) erase: bool,
+
+    /// Flash userdata without asking for confirmation
+    pub(crate) force: bool,
+}
+
+pub(crate) fn action_flash(args: FlashArgs) -> i32 {
+    let FlashArgs {
+        usb_backend,
+        verbose,
+        reboot_mode,
+        wait,
+        skip_size_check,
+        skip_md5,
+        pit,
+        packages,
+        partitions,
+        skip,
+        disable_verity,
+        disable_verification,
+        csc_code,
+        erase,
+        force,
+    } = args;
+
     if !force {
         let mut check_packages = Vec::with_capacity(packages.len());
-        for pkg in packages {
+        for pkg in &packages {
             let file = match File::open(pkg) {
                 Ok(f) => f,
                 Err(e) => {
@@ -238,7 +286,7 @@ pub(crate) fn action_flash(
             }
         };
 
-        if flashes_userdata(&package_files, partitions, skip) {
+        if flashes_userdata(&package_files, &partitions, &skip) {
             if !io::stdin().is_terminal() {
                 print_error!(
                     "Flash list contains userdata, which will wipe the device's data. \
@@ -255,7 +303,7 @@ pub(crate) fn action_flash(
     }
 
     let mut opened_packages = Vec::with_capacity(packages.len());
-    for pkg in packages {
+    for pkg in &packages {
         let file = match File::open(pkg) {
             Ok(f) => f,
             Err(e) => {
@@ -267,7 +315,7 @@ pub(crate) fn action_flash(
     }
 
     let mut opened_partitions = Vec::with_capacity(partitions.len());
-    for p in partitions {
+    for p in &partitions {
         let file = match File::open(&p.filename) {
             Ok(f) => f,
             Err(e) => {
@@ -279,7 +327,7 @@ pub(crate) fn action_flash(
     }
 
     let pit_bytes = match pit {
-        Some(pit_path) => match std::fs::read(pit_path) {
+        Some(pit_path) => match std::fs::read(&pit_path) {
             Ok(b) => Some(b),
             Err(e) => {
                 print_error!("Failed to read file \"{}\": {}", pit_path, e);
@@ -321,10 +369,10 @@ pub(crate) fn action_flash(
             .erase(erase)
             .packages(opened_packages)
             .partitions(opened_partitions)
-            .skip(skip)
+            .skip(&skip)
             .disable_verity(disable_verity)
             .disable_verification(disable_verification)
-            .sales_code(csc_code);
+            .sales_code(csc_code.as_deref());
 
         if let Some(buffer) = pit_bytes {
             flash_manager = flash_manager.pit(buffer);
