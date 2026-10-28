@@ -24,6 +24,8 @@ const TAR_BLOCK_SIZE: u64 = 512;
 /// skip unread entry payloads.
 pub(crate) struct TarArchive<R> {
     reader: R,
+    /// Total length of the archive, determined on the first `next_entry` call.
+    len: Option<u64>,
     next_header_pos: u64,
     done: bool,
 }
@@ -72,6 +74,7 @@ impl<R: AsyncRead + AsyncSeek + Unpin> TarArchive<R> {
     pub(crate) fn new(reader: R) -> Self {
         Self {
             reader,
+            len: None,
             next_header_pos: 0,
             done: false,
         }
@@ -156,6 +159,13 @@ impl<R: AsyncRead + AsyncSeek + Unpin> TarArchive<R> {
                 continue;
             }
 
+            if entry_type.is_gnu_sparse() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "GNU sparse entries are not supported",
+                ));
+            }
+
             let path_bytes: Cow<'_, [u8]> = if let Some(ref bytes) = gnu_longname {
                 Cow::Borrowed(bytes.strip_suffix(&[0]).unwrap_or(bytes))
             } else if let Some(path) = pax_extensions.as_deref().and_then(pax_path_value) {
@@ -188,19 +198,32 @@ impl<R: AsyncRead + AsyncSeek + Unpin> TarArchive<R> {
     ) -> io::Result<Option<(::tar::Header, u64, u64)>> {
         let mut header = ::tar::Header::new_old();
 
+        let len = match self.len {
+            Some(len) => len,
+            None => *self.len.insert(self.reader.seek(SeekFrom::End(0)).await?),
+        };
+
         self.reader
             .seek(SeekFrom::Start(self.next_header_pos))
             .await?;
 
         if !try_read_all(&mut self.reader, header.as_mut_bytes()).await? {
-            return Ok(None);
+            // A complete archive ends with zero blocks, so EOF here means the file
+            // was cut exactly at an entry boundary and later entries are missing.
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "archive is missing its end-of-archive marker (truncated?)",
+            ));
         }
 
         if header.as_bytes().iter().all(|&b| b == 0) {
             return Ok(None);
         }
 
-        self.next_header_pos += TAR_BLOCK_SIZE;
+        self.next_header_pos = self
+            .next_header_pos
+            .checked_add(TAR_BLOCK_SIZE)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "size overflow"))?;
 
         // Verify the header checksum (bytes 148..156 are treated as ASCII spaces)
         let sum = header.as_bytes()[..148]
@@ -229,6 +252,15 @@ impl<R: AsyncRead + AsyncSeek + Unpin> TarArchive<R> {
             && let Some(pax_size) = pax_size_value(pax_bytes)
         {
             size = pax_size;
+        }
+
+        // Seeking past EOF succeeds, so a truncated archive would otherwise look like
+        // a clean end and silently drop the remaining entries.
+        if file_pos.checked_add(size).is_none_or(|end| end > len) {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "entry extends past the end of the archive",
+            ));
         }
 
         let padded_size = size
@@ -261,11 +293,14 @@ async fn try_read_all<R: AsyncRead + Unpin>(reader: &mut R, buf: &mut [u8]) -> i
 }
 
 fn pax_size_value(a: &[u8]) -> Option<u64> {
-    ::tar::PaxExtensions::new(a)
-        .filter_map(|f| f.ok())
-        .find(|f| f.key_bytes() == b"size")
-        .and_then(|f| f.value().ok())
-        .and_then(|v| v.parse::<u64>().ok())
+    // Mirrors tar::pax_extensions_value: a malformed record ends the lookup
+    for ext in ::tar::PaxExtensions::new(a) {
+        let ext = ext.ok()?;
+        if ext.key_bytes() == b"size" {
+            return ext.value().ok()?.parse().ok();
+        }
+    }
+    None
 }
 
 fn pax_path_value(a: &[u8]) -> Option<&[u8]> {
@@ -361,18 +396,92 @@ mod tests {
                 io::ErrorKind::InvalidData
             );
 
-            // Truncated entry payload must fail with UnexpectedEof when read
+            // Truncated entry payload must fail with UnexpectedEof on next_entry
             let mut truncated_archive = TarArchive::new(Cursor::new(&tar_bytes[..600]));
-            let mut truncated_entry = truncated_archive.next_entry().await.unwrap().unwrap();
-            let mut buf = Vec::new();
+            let err = truncated_archive.next_entry().await.err().unwrap();
+            assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+            assert_eq!(err.to_string(), "entry extends past the end of the archive");
+
+            // Cut inside a later unread entry: earlier entries return, then UnexpectedEof
+            let cut_offset = 2048 + 512 + 5;
+            let mut cut_archive = TarArchive::new(Cursor::new(&tar_bytes[..cut_offset]));
+            let entry1 = cut_archive.next_entry().await.unwrap().unwrap();
+            assert_eq!(entry1.path(), "boot.img.lz4");
+            let err = cut_archive.next_entry().await.err().unwrap();
+            assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+            assert_eq!(err.to_string(), "entry extends past the end of the archive");
+
+            // Cut exactly at an entry boundary (no zero blocks)
+            let mut cut_boundary_archive = TarArchive::new(Cursor::new(&tar_bytes[..2048]));
+            let entry1 = cut_boundary_archive.next_entry().await.unwrap().unwrap();
+            assert_eq!(entry1.path(), "boot.img.lz4");
+            let err = cut_boundary_archive.next_entry().await.err().unwrap();
+            assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
             assert_eq!(
-                truncated_entry
-                    .read_to_end(&mut buf)
-                    .await
-                    .unwrap_err()
-                    .kind(),
-                io::ErrorKind::UnexpectedEof
+                err.to_string(),
+                "archive is missing its end-of-archive marker (truncated?)"
             );
+
+            // A single trailing zero block is accepted
+            let mut single_zero_tar = tar_bytes[..2048].to_vec();
+            single_zero_tar.extend_from_slice(&[0u8; 512]);
+            let mut archive = TarArchive::new(Cursor::new(single_zero_tar.as_slice()));
+            assert!(archive.next_entry().await.unwrap().is_some());
+            assert!(archive.next_entry().await.unwrap().is_none());
+
+            // A single trailing zero block with .tar.md5 footer is accepted
+            single_zero_tar.extend_from_slice(b"0123456789abcdef0123456789abcdef  AP.tar\n");
+            let mut archive = TarArchive::new(Cursor::new(single_zero_tar.as_slice()));
+            assert!(archive.next_entry().await.unwrap().is_some());
+            assert!(archive.next_entry().await.unwrap().is_none());
+
+            // 0-byte input gives an error
+            let mut empty_archive = TarArchive::new(Cursor::new(&[][..]));
+            let err = empty_archive.next_entry().await.err().unwrap();
+            assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+            assert_eq!(
+                err.to_string(),
+                "archive is missing its end-of-archive marker (truncated?)"
+            );
+
+            // Base-256 size of 2^63 gives an error
+            let mut base256_header = ::tar::Header::new_gnu();
+            base256_header.set_path("huge.bin").unwrap();
+            let header_bytes = base256_header.as_mut_bytes();
+            header_bytes[124] = 0x80;
+            header_bytes[128] = 0x80;
+            base256_header.set_cksum();
+            let mut tar = base256_header.as_bytes().to_vec();
+            tar.extend_from_slice(&[0u8; 1024]);
+            let mut archive = TarArchive::new(Cursor::new(tar.as_slice()));
+            let err = archive.next_entry().await.err().unwrap();
+            assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+            assert_eq!(err.to_string(), "entry extends past the end of the archive");
+        });
+    }
+
+    #[test]
+    fn test_pax_size_value() {
+        // Malformed record "5 a=b\n" stops the lookup, returning None (so header size is kept)
+        assert_eq!(pax_size_value(b"5 a=b\n13 size=1024\n"), None);
+        // Well-formed records parse size
+        assert_eq!(pax_size_value(b"6 a=b\n13 size=1024\n"), Some(1024));
+    }
+
+    #[test]
+    fn test_gnu_sparse_rejected() {
+        futures::executor::block_on(async {
+            let mut header = ::tar::Header::new_gnu();
+            header.set_path("sparse.img").unwrap();
+            header.set_entry_type(::tar::EntryType::new(b'S'));
+            header.set_size(0);
+            header.set_cksum();
+            let mut tar = header.as_bytes().to_vec();
+            tar.extend_from_slice(&[0u8; 1024]);
+            let mut archive = TarArchive::new(Cursor::new(tar.as_slice()));
+            let err = archive.next_entry().await.err().unwrap();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(err.to_string(), "GNU sparse entries are not supported");
         });
     }
 }
