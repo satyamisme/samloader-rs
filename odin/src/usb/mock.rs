@@ -25,6 +25,7 @@ use binrw::BinRead;
 use samloader_pit::PitData;
 use std::collections::VecDeque;
 use std::io::Cursor;
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -34,6 +35,26 @@ enum State {
     TransmitFlash,
     TransmitSlice,
     PitFlash,
+}
+
+/// A device-visible operation recorded by [`MockBackend`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MockEvent {
+    /// USERDATA NAND erase.
+    NandErase,
+    /// PIT uploaded to the device.
+    PitFlash,
+    /// PIT dumped from the device.
+    PitDump,
+    /// A committed slice (raw or LZ4-compressed bytes as sent) for a partition.
+    Slice {
+        /// The numeric partition ID targeted by the slice.
+        partition_id: u32,
+        /// Whether the payload was sent with LZ4 compression.
+        lz4: bool,
+        /// The received payload data, truncated to the announced slice size.
+        data: Vec<u8>,
+    },
 }
 
 /// Target hardware, partition table, and protocol characteristics of a simulated Samsung device.
@@ -361,6 +382,9 @@ pub struct MockBackend {
     protocol_version: u32,
     product_override: Option<String>,
     empty_send_count: usize,
+    event_log: Arc<Mutex<Vec<MockEvent>>>,
+    current_slice_announced_size: Option<usize>,
+    current_slice_data: Vec<u8>,
 }
 
 impl Default for MockBackend {
@@ -407,7 +431,15 @@ impl MockBackend {
             protocol_version: p_ver,
             product_override: None,
             empty_send_count: 0,
+            event_log: Arc::new(Mutex::new(Vec::new())),
+            current_slice_announced_size: None,
+            current_slice_data: Vec::new(),
         }
+    }
+
+    /// Returns a handle to the log of device-visible events, shared with clones of the handle.
+    pub fn event_log(&self) -> Arc<Mutex<Vec<MockEvent>>> {
+        Arc::clone(&self.event_log)
     }
 
     /// Returns a reference to the active `DeviceProfile`.
@@ -500,6 +532,8 @@ impl UsbTransfer for MockBackend {
         self.outgoing_queue.clear();
         self.current_chunk_index = 0;
         self.packet_size = self.profile.default_packet_size;
+        self.current_slice_announced_size = None;
+        self.current_slice_data.clear();
     }
 
     async fn send_data(&mut self, data: &[u8], _timeout: i32) -> bool {
@@ -550,6 +584,8 @@ impl UsbTransfer for MockBackend {
                         self.push_response(STATUS_FAIL, err as u32);
                     } else {
                         self.current_partition_bytes += chunk_size;
+                        self.current_slice_data
+                            .extend_from_slice(&self.incoming_buffer[..chunk_size]);
                         self.push_response(STREAMING_CHUNK_ACK, self.current_chunk_index);
                         self.current_chunk_index += 1;
                     }
@@ -624,6 +660,7 @@ impl UsbTransfer for MockBackend {
                                     if let Some(err) = self.fail_nand_erase {
                                         self.push_response(STATUS_FAIL, err as u32);
                                     } else {
+                                        self.event_log.lock().unwrap().push(MockEvent::NandErase);
                                         self.push_response(
                                             CMD_SESSION_INIT,
                                             self.nand_erase_sectors,
@@ -638,9 +675,11 @@ impl UsbTransfer for MockBackend {
                                 PitCommand::Flash => {
                                     self.state = State::PitFlash;
                                     self.active_pit_data.clear();
+                                    self.event_log.lock().unwrap().push(MockEvent::PitFlash);
                                     self.push_response(CMD_PIT, 0);
                                 }
                                 PitCommand::Dump => {
+                                    self.event_log.lock().unwrap().push(MockEvent::PitDump);
                                     self.push_response(CMD_PIT, self.active_pit_data.len() as u32);
                                 }
                                 PitCommand::Slice { slice } => {
@@ -661,16 +700,49 @@ impl UsbTransfer for MockBackend {
                                     self.current_partition_bytes = 0;
                                     self.push_response(CMD_TRANSMIT, 0);
                                 }
-                                TransmitCommand::Slice { .. }
-                                | TransmitCommand::Lz4Slice { .. } => {
+                                TransmitCommand::Slice { .. } => {
                                     self.state = State::TransmitSlice;
                                     self.current_chunk_index = 0;
+                                    self.current_slice_announced_size = None;
+                                    self.current_slice_data.clear();
                                     self.push_response(CMD_TRANSMIT, 0);
                                 }
-                                TransmitCommand::End(_) | TransmitCommand::Lz4End(_) => {
+                                TransmitCommand::Lz4Slice {
+                                    compressed_size, ..
+                                } => {
+                                    self.state = State::TransmitSlice;
+                                    self.current_chunk_index = 0;
+                                    self.current_slice_announced_size =
+                                        Some(compressed_size as usize);
+                                    self.current_slice_data.clear();
+                                    self.push_response(CMD_TRANSMIT, 0);
+                                }
+                                TransmitCommand::End(ref commit)
+                                | TransmitCommand::Lz4End(ref commit) => {
                                     if let Some(err) = self.fail_commit {
                                         self.push_response(STATUS_FAIL, err as u32);
                                     } else {
+                                        let partition_id = commit.partition_id();
+                                        let lz4 =
+                                            matches!(&transmit_cmd, TransmitCommand::Lz4End(_));
+                                        // The raw slice size announced at the start is rounded
+                                        // up to 128 KB, so use the exact size from the commit.
+                                        // LZ4 commits carry the decompressed size instead, so
+                                        // use the announced compressed size for those.
+                                        let payload_size = if lz4 {
+                                            self.current_slice_announced_size
+                                                .unwrap_or(self.current_slice_data.len())
+                                        } else {
+                                            commit.slice_size() as usize
+                                        };
+                                        let mut data = std::mem::take(&mut self.current_slice_data);
+                                        data.truncate(payload_size);
+                                        self.event_log.lock().unwrap().push(MockEvent::Slice {
+                                            partition_id,
+                                            lz4,
+                                            data,
+                                        });
+
                                         self.current_partition_bytes = 0;
                                         self.state = State::SessionBegun;
                                         self.push_response(CMD_TRANSMIT, 0);

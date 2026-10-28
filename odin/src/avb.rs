@@ -55,7 +55,7 @@ pub(crate) fn rewrite_vbmeta(
         let footer = &data[data.len() - AVB_FOOTER_SIZE..];
         if !footer.starts_with(AVB_FOOTER_MAGIC) {
             return Err(invalid_data(format!(
-                "Failed to find AVB_FOOTER at offset: {}",
+                "Failed to find AVB_FOOTER at offset: {}, is BOARD_AVB_ENABLE true?",
                 data.len() - AVB_FOOTER_SIZE
             )));
         }

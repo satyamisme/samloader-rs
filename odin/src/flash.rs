@@ -29,6 +29,7 @@ use std::collections::HashSet;
 use std::io::{self, SeekFrom};
 use std::path::Path;
 
+#[derive(Clone, Debug)]
 struct IndexedEntry {
     original_name: String,
     normalized_name: String,
@@ -36,6 +37,158 @@ struct IndexedEntry {
     offset: u64,
     size: u64,
     is_lz4: bool,
+}
+
+/// Result of indexing TAR packages.
+struct PackageScan {
+    entries: Vec<IndexedEntry>,
+    has_download_list: bool,
+    super_used_size: Option<u32>,
+    pit_bytes: Option<Vec<u8>>,
+}
+
+async fn scan_packages<R: AsyncRead + AsyncSeek + Unpin>(
+    packages: &mut [(String, R)],
+    want_pit: bool,
+) -> Result<PackageScan, FlashError> {
+    if packages.is_empty() {
+        return Ok(PackageScan {
+            entries: Vec::new(),
+            has_download_list: false,
+            super_used_size: None,
+            pit_bytes: None,
+        });
+    }
+
+    let mut archives_download_lists: Vec<HashSet<String>> = Vec::new();
+    let mut all_packages_entries: Vec<Vec<IndexedEntry>> = Vec::new();
+    let mut pit_from_tar: Option<Vec<u8>> = None;
+    let mut has_download_list = false;
+    let mut super_used_size = None;
+
+    for (package_index, (pkg_name, reader)) in packages.iter_mut().enumerate() {
+        let mut archive = TarArchive::new(&mut *reader);
+        let mut package_entries = Vec::new();
+
+        while let Some(mut entry) = archive
+            .next_entry()
+            .await
+            .map_err(|e| FlashError::ArchiveCorrupted(pkg_name.clone(), e))?
+        {
+            let entry_path = entry.path().to_string();
+            let offset = entry.raw_file_position();
+            let size = entry.size();
+
+            let (normalized_name, is_lz4) = normalize_basename(&entry_path);
+
+            if normalized_name == "download-list.txt" {
+                let mut content = String::new();
+                entry
+                    .read_to_string(&mut content)
+                    .await
+                    .map_err(|e| FlashError::ArchiveCorrupted(pkg_name.clone(), e))?;
+
+                has_download_list = true;
+                let download_list = content
+                    .lines()
+                    .filter_map(|s| {
+                        let s = s.trim();
+                        if s.is_empty() {
+                            None
+                        } else {
+                            Some(s.to_string())
+                        }
+                    })
+                    .collect();
+                archives_download_lists.push(download_list);
+            } else if normalized_name == "super_used_size.txt" {
+                let mut content = String::new();
+                entry
+                    .read_to_string(&mut content)
+                    .await
+                    .map_err(|e| FlashError::ArchiveCorrupted(pkg_name.clone(), e))?;
+                let val = content.trim().parse::<u32>().map_err(|e| {
+                    FlashError::ArchiveCorrupted(
+                        pkg_name.clone(),
+                        io::Error::new(io::ErrorKind::InvalidData, e),
+                    )
+                })?;
+                super_used_size = Some(val);
+            } else if normalized_name.ends_with(".pit") {
+                if want_pit && pit_from_tar.is_none() {
+                    let mut bytes = Vec::new();
+                    entry
+                        .read_to_end(&mut bytes)
+                        .await
+                        .map_err(|e| FlashError::ArchiveCorrupted(pkg_name.clone(), e))?;
+                    pit_from_tar = Some(bytes);
+                }
+            } else {
+                package_entries.push(IndexedEntry {
+                    original_name: entry_path,
+                    normalized_name,
+                    package_index,
+                    offset,
+                    size,
+                    is_lz4,
+                });
+            }
+        }
+
+        all_packages_entries.push(package_entries);
+    }
+
+    // If any package contained a manifest, we use it as our global download allowlist
+    let download_allowlist = if let Some((first, rest)) = archives_download_lists.split_first() {
+        if !rest.iter().all(|m| m == first) {
+            return Err(FlashError::CrossArchiveInconsistency);
+        }
+        Some(first)
+    } else {
+        None
+    };
+
+    let mut resolved_entries: Vec<IndexedEntry> = Vec::new();
+
+    // Apply manifest filtering and positional precedence (last-writer-wins)
+    for package_entries in all_packages_entries {
+        for entry in package_entries {
+            if let Some(allowlist) = download_allowlist {
+                if allowlist.contains(&entry.normalized_name) {
+                    resolved_entries.push(entry);
+                } else {
+                    progress::println(&format!(
+                        "Skipping {} (not in download-list.txt)",
+                        entry.original_name
+                    ));
+                }
+            } else {
+                resolved_entries.push(entry);
+            }
+        }
+    }
+
+    Ok(PackageScan {
+        entries: resolved_entries,
+        has_download_list,
+        super_used_size,
+        pit_bytes: pit_from_tar,
+    })
+}
+
+/// Lists the file names (directory and `.lz4` suffix stripped) that would be
+/// considered for flashing from `packages`, honoring `download-list.txt`.
+/// Metadata files and PIT files are excluded. Useful for confirmation prompts
+/// before connecting to a device.
+pub async fn package_flash_files<R: AsyncRead + AsyncSeek + Unpin>(
+    packages: &mut [(String, R)],
+) -> Result<Vec<String>, FlashError> {
+    let scan = scan_packages(packages, false).await?;
+    Ok(scan
+        .entries
+        .into_iter()
+        .map(|e| e.normalized_name)
+        .collect())
 }
 
 fn normalize_basename(path_str: &str) -> (String, bool) {
@@ -73,6 +226,13 @@ fn is_vbmeta_entry(entry: &PitEntry) -> bool {
     ["VBMETA", "VBMETA_A", "VBMETA_B"]
         .iter()
         .any(|suffix| name.ends_with(suffix))
+}
+
+fn is_top_level_vbmeta_entry(entry: &PitEntry) -> bool {
+    let name = entry.partition_name.to_string_lossy();
+    ["VBMETA", "VBMETA_A", "VBMETA_B"]
+        .iter()
+        .any(|vbmeta| name.eq_ignore_ascii_case(vbmeta))
 }
 
 fn is_boot_entry(entry: &PitEntry) -> bool {
@@ -309,6 +469,19 @@ impl<'a, P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin>
 
         // If no packages, partitions, or explicit PIT are specified, complete session and return
         if self.packages.is_empty() && self.partitions.is_empty() && self.pit_file_bytes.is_none() {
+            if !self.skip.is_empty() {
+                progress::println("Warning: --skip ignored when no partitions are flashed");
+            }
+            if self.vbmeta_flags & avb::AVB_VBMETA_IMAGE_FLAGS_HASHTREE_DISABLED != 0 {
+                progress::println(
+                    "Warning: --disable-verity ignored when no partitions are flashed",
+                );
+            }
+            if self.vbmeta_flags & avb::AVB_VBMETA_IMAGE_FLAGS_VERIFICATION_DISABLED != 0 {
+                progress::println(
+                    "Warning: --disable-verification ignored when no partitions are flashed",
+                );
+            }
             if self.erase {
                 self.session.nand_erase().await?;
             }
@@ -322,31 +495,42 @@ impl<'a, P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin>
 
         // Step 1: Verify MD5 footers and scan TAR containers to index entries
         self.verify_packages().await?;
-        let resolved_entries = self.scan_tar_packages().await?;
+        let entries = self.scan_tar_packages().await?;
 
-        // Step 2: Flash PIT if available and download active PIT data from the device
-        let pit_data = self.download_and_parse_pit().await?;
+        // Step 2: Plan against a PIT before anything destructive happens on the device.
+        // With a local PIT, the plan is checked against it, then rebuilt against the
+        // PIT read back from the device after flashing. Otherwise the device PIT is
+        // read before the NAND erase, which does not modify it.
+        let flashes_pit = self.pit_file_bytes.is_some();
+        let planning_pit;
+        let mut flashed_pit = None;
 
-        // Step 3: Resolve the partitions excluded from flashing
-        let skipped_ids = self.resolve_skipped_partitions(&pit_data)?;
+        let planned_partitions = if flashes_pit {
+            planning_pit = self.parse_local_pit()?;
+            self.plan_partitions(&planning_pit, &entries, false).await?;
 
-        // The super size check is meaningless when super is not flashed
-        if pit_data
-            .entries
-            .iter()
-            .any(|e| skipped_ids.contains(&e.partition_id) && is_super_entry(e))
-        {
-            self.super_used_size = None;
-        }
+            if self.erase {
+                self.session.nand_erase().await?;
+            }
 
-        // Step 4: Map entries and individual files to FirmwarePartitionPayload items
-        let mut planned_partitions = self
-            .build_partition_infos(&pit_data, resolved_entries, &skipped_ids)
-            .await?;
+            let pit_bytes = self.pit_file_bytes.as_ref().unwrap();
+            progress::println("Flashing PIT");
+            self.session.send_pit_info(pit_bytes).await?;
+            progress::println("PIT flash successful\n");
 
-        // Step 5: Rewrite vbmeta flags if requested
-        self.rewrite_vbmeta_payloads(&pit_data, &mut planned_partitions)
-            .await?;
+            let downloaded = self.download_pit().await?;
+            let pit_ref = flashed_pit.insert(downloaded);
+            self.plan_partitions(pit_ref, &entries, true).await?
+        } else {
+            let downloaded = self.download_pit().await?;
+            let pit_ref = flashed_pit.insert(downloaded);
+            let planned = self.plan_partitions(pit_ref, &entries, true).await?;
+
+            if self.erase {
+                self.session.nand_erase().await?;
+            }
+            planned
+        };
 
         // Auto-detect super_used_size if not specified in TAR metadata
         if self.super_used_size.is_none()
@@ -361,7 +545,7 @@ impl<'a, P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin>
             self.super_used_size = inspect_super_partition(super_part, &mut reader).await;
         }
 
-        // Step 6: Flash payloads to the device
+        // Step 3: Flash payloads to the device
         self.flash_partitions(planned_partitions, self.reboot_mode)
             .await?;
 
@@ -387,144 +571,63 @@ impl<'a, P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin>
 
     // Helper 2: Scan TAR packages to find resolved entries and pull package PIT if needed
     async fn scan_tar_packages(&mut self) -> Result<Vec<IndexedEntry>, FlashError> {
-        if self.packages.is_empty() {
-            return Ok(Vec::new());
+        let want_pit = self.pit_file_bytes.is_none();
+        let scan = scan_packages(&mut self.packages, want_pit).await?;
+        if scan.has_download_list {
+            self.has_download_list = true;
         }
-
-        let mut archives_download_lists: Vec<HashSet<String>> = Vec::new();
-        let mut all_packages_entries: Vec<Vec<IndexedEntry>> = Vec::new();
-        let mut pit_from_tar: Option<Vec<u8>> = None;
-
-        for (package_index, (pkg_name, reader)) in self.packages.iter_mut().enumerate() {
-            let mut archive = TarArchive::new(&mut *reader);
-            let mut package_entries = Vec::new();
-
-            while let Some(mut entry) = archive
-                .next_entry()
-                .await
-                .map_err(|e| FlashError::ArchiveCorrupted(pkg_name.clone(), e))?
-            {
-                let entry_path = entry.path().to_string();
-                let offset = entry.raw_file_position();
-                let size = entry.size();
-
-                let (normalized_name, is_lz4) = normalize_basename(&entry_path);
-
-                if normalized_name == "download-list.txt" {
-                    let mut content = String::new();
-                    entry
-                        .read_to_string(&mut content)
-                        .await
-                        .map_err(|e| FlashError::ArchiveCorrupted(pkg_name.clone(), e))?;
-
-                    self.has_download_list = true;
-                    let download_list = content
-                        .lines()
-                        .filter_map(|s| {
-                            let s = s.trim();
-                            if s.is_empty() {
-                                None
-                            } else {
-                                Some(s.to_string())
-                            }
-                        })
-                        .collect();
-                    archives_download_lists.push(download_list);
-                } else if normalized_name == "super_used_size.txt" {
-                    let mut content = String::new();
-                    entry
-                        .read_to_string(&mut content)
-                        .await
-                        .map_err(|e| FlashError::ArchiveCorrupted(pkg_name.clone(), e))?;
-                    let val = content.trim().parse::<u32>().map_err(|e| {
-                        FlashError::ArchiveCorrupted(
-                            pkg_name.clone(),
-                            io::Error::new(io::ErrorKind::InvalidData, e),
-                        )
-                    })?;
-                    self.super_used_size = Some(val);
-                } else if normalized_name.ends_with(".pit") {
-                    if self.pit_file_bytes.is_none() {
-                        let mut bytes = Vec::new();
-                        entry
-                            .read_to_end(&mut bytes)
-                            .await
-                            .map_err(|e| FlashError::ArchiveCorrupted(pkg_name.clone(), e))?;
-                        pit_from_tar = Some(bytes);
-                    }
-                } else {
-                    package_entries.push(IndexedEntry {
-                        original_name: entry_path,
-                        normalized_name,
-                        package_index,
-                        offset,
-                        size,
-                        is_lz4,
-                    });
-                }
-            }
-
-            all_packages_entries.push(package_entries);
+        if self.super_used_size.is_none() {
+            self.super_used_size = scan.super_used_size;
         }
-
-        // If any package contained a manifest, we use it as our global download allowlist
-        let download_allowlist = if let Some((first, rest)) = archives_download_lists.split_first()
-        {
-            if !rest.iter().all(|m| m == first) {
-                return Err(FlashError::CrossArchiveInconsistency);
-            }
-            Some(first)
-        } else {
-            None
-        };
-
-        let mut resolved_entries: Vec<IndexedEntry> = Vec::new();
-
-        // Apply manifest filtering and positional precedence (last-writer-wins)
-        for package_entries in all_packages_entries {
-            for entry in package_entries {
-                if let Some(allowlist) = download_allowlist {
-                    if allowlist.contains(&entry.normalized_name) {
-                        resolved_entries.push(entry);
-                    } else {
-                        progress::println(&format!(
-                            "Skipping {} (not in download-list.txt)",
-                            entry.original_name
-                        ));
-                    }
-                } else {
-                    resolved_entries.push(entry);
-                }
-            }
-        }
-
         if self.pit_file_bytes.is_none() {
-            self.pit_file_bytes = pit_from_tar;
+            self.pit_file_bytes = scan.pit_bytes;
         }
-
-        Ok(resolved_entries)
+        Ok(scan.entries)
     }
 
-    // Helper 3: Flash PIT if available and download active PIT data
-    async fn download_and_parse_pit(&mut self) -> Result<PitData, FlashError> {
-        if self.erase {
-            self.session.nand_erase().await?;
-        }
+    // Helper 3: Parse local PIT file bytes
+    fn parse_local_pit(&self) -> Result<PitData, FlashError> {
+        let pit_bytes = self.pit_file_bytes.as_ref().unwrap();
+        PitData::new(pit_bytes).map_err(FlashError::PitUnpackFailed)
+    }
 
-        if let Some(pit_bytes) = &self.pit_file_bytes {
-            progress::println("Flashing PIT");
-            self.session.send_pit_info(pit_bytes).await?;
-            progress::println("PIT flash successful\n");
-        }
-
+    // Helper 4: Download active PIT data from device
+    async fn download_pit(&mut self) -> Result<PitData, FlashError> {
         progress::println("Downloading device's PIT file");
         let pit_buffer = self.session.receive_pit_info().await?;
-
         let pit_data = PitData::new(&pit_buffer).map_err(FlashError::PitUnpackFailed)?;
         Ok(pit_data)
     }
 
-    // Helper 4: Resolve skip targets into the IDs of the PIT entries they match
+    // Helper 5: Plan partitions against a given PIT
+    async fn plan_partitions<'c>(
+        &mut self,
+        pit_data: &'c PitData,
+        entries: &[IndexedEntry],
+        report: bool,
+    ) -> Result<Vec<FirmwarePartitionPayload<'c>>, FlashError> {
+        let skipped_ids = self.resolve_skipped_partitions(pit_data)?;
+
+        // The super size check is meaningless when super is not flashed
+        if pit_data
+            .entries
+            .iter()
+            .any(|e| skipped_ids.contains(&e.partition_id) && is_super_entry(e))
+        {
+            self.super_used_size = None;
+        }
+
+        let mut planned_partitions = self
+            .build_partition_infos(pit_data, entries, &skipped_ids, report)
+            .await?;
+
+        self.rewrite_vbmeta_payloads(pit_data, &mut planned_partitions, report)
+            .await?;
+
+        Ok(planned_partitions)
+    }
+
+    // Helper 6: Resolve skip targets into the IDs of the PIT entries they match
     fn resolve_skipped_partitions(&self, pit_data: &PitData) -> Result<HashSet<u32>, FlashError> {
         let mut skipped_ids = HashSet::new();
         for target in &self.skip {
@@ -542,12 +645,13 @@ impl<'a, P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin>
         Ok(skipped_ids)
     }
 
-    // Helper 5: Resolve package entries and standalone files into FirmwarePartitionPayload items
+    // Helper 7: Resolve package entries and standalone files into FirmwarePartitionPayload items
     async fn build_partition_infos<'c>(
         &mut self,
         pit_data: &'c PitData,
-        resolved_entries: Vec<IndexedEntry>,
+        resolved_entries: &[IndexedEntry],
         skipped_ids: &HashSet<u32>,
+        report: bool,
     ) -> Result<Vec<FirmwarePartitionPayload<'c>>, FlashError> {
         enum CandidateSource {
             Archive(IndexedEntry),
@@ -565,16 +669,18 @@ impl<'a, P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin>
         for entry in resolved_entries {
             let Some(pit_entry) = find_pit_entry_by_filename(pit_data, &entry.normalized_name)
             else {
-                progress::println(&format!(
-                    "Skipping orphan file \"{}\" (no matching partition in PIT)",
-                    entry.original_name
-                ));
+                if report {
+                    progress::println(&format!(
+                        "Skipping orphan file \"{}\" (no matching partition in PIT)",
+                        entry.original_name
+                    ));
+                }
                 continue;
             };
 
             candidates.push(Candidate {
                 pit_entry,
-                source: CandidateSource::Archive(entry),
+                source: CandidateSource::Archive(entry.clone()),
             });
         }
 
@@ -625,10 +731,12 @@ impl<'a, P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin>
         // 4. Drop partitions excluded with skip targets
         unique_candidates.retain(|candidate| {
             if skipped_ids.contains(&candidate.pit_entry.partition_id) {
-                progress::println(&format!(
-                    "Skipping {} (excluded with --skip)",
-                    candidate.pit_entry.partition_name.to_string_lossy()
-                ));
+                if report {
+                    progress::println(&format!(
+                        "Skipping {} (excluded with --skip)",
+                        candidate.pit_entry.partition_name.to_string_lossy()
+                    ));
+                }
                 false
             } else {
                 true
@@ -701,18 +809,19 @@ impl<'a, P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin>
         Ok(planned_partitions)
     }
 
-    // Helper 6: Set the requested AVB flags in vbmeta payloads. Like fastboot, the
+    // Helper 8: Set the requested AVB flags in vbmeta payloads. Like fastboot, the
     // top-level vbmeta is looked up in boot on devices without a vbmeta partition.
     async fn rewrite_vbmeta_payloads(
         &mut self,
         pit_data: &PitData,
         planned_partitions: &mut [FirmwarePartitionPayload<'_>],
+        report: bool,
     ) -> Result<(), FlashError> {
         if self.vbmeta_flags == 0 {
             return Ok(());
         }
 
-        let has_vbmeta_partition = pit_data.entries.iter().any(is_vbmeta_entry);
+        let has_vbmeta_partition = pit_data.entries.iter().any(is_top_level_vbmeta_entry);
         let mut rewritten = false;
         for planned in planned_partitions.iter_mut() {
             let pit_entry = planned.pit_entry;
@@ -740,19 +849,28 @@ impl<'a, P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin>
             let Some(offset) = avb::rewrite_vbmeta(&mut data, self.vbmeta_flags, in_footer)
                 .map_err(rewrite_err)?
             else {
+                if report {
+                    progress::println(&format!(
+                        "Warning: {} is smaller than a vbmeta header, AVB flags left unchanged",
+                        name
+                    ));
+                }
+                rewritten = true;
                 continue;
             };
 
-            progress::println(&format!(
-                "Rewriting {} vbmeta struct at offset: {}",
-                name, offset
-            ));
+            if report {
+                progress::println(&format!(
+                    "Rewriting {} vbmeta struct at offset: {}",
+                    name, offset
+                ));
+            }
             planned.lz4_header = None;
             planned.source = FirmwarePartitionSource::Memory(data);
             rewritten = true;
         }
 
-        if !rewritten {
+        if !rewritten && report {
             progress::println(
                 "Warning: no vbmeta image is being flashed, AVB flags left unchanged",
             );
@@ -761,7 +879,7 @@ impl<'a, P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin>
         Ok(())
     }
 
-    // Helper 7: Flash deduplicated partition payloads to the device
+    // Helper 9: Flash deduplicated partition payloads to the device
     async fn flash_partitions(
         &mut self,
         planned_partitions: Vec<FirmwarePartitionPayload<'_>>,
@@ -836,7 +954,7 @@ impl<'a, P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin>
 mod tests {
     use super::*;
     use crate::odin::OdinConnection;
-    use crate::usb::MockBackend;
+    use crate::usb::{MockBackend, MockEvent};
 
     fn build_tar(files: &[(&str, &[u8])]) -> Vec<u8> {
         let mut builder = tar::Builder::new(Vec::new());
@@ -970,14 +1088,17 @@ mod tests {
             connection.init().await.unwrap();
             let mut session = connection.begin_session().await.unwrap();
 
-            let mut manager = FlashManager::new(&mut session).pit(
-                &include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/test-data/M3_EUR_OPEN_4G.pit"
-                ))[..],
-            );
+            let pit_bytes = include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/test-data/M3_EUR_OPEN_4G.pit"
+            ));
+            let mut manager = FlashManager::new(&mut session).pit(&pit_bytes[..]);
 
-            let pit_data = manager.download_and_parse_pit().await.unwrap();
+            let local_pit = manager.parse_local_pit().unwrap();
+            assert_eq!(local_pit.cpu_bl_id.to_string_lossy(), "Mx-MDM");
+
+            manager.session.send_pit_info(pit_bytes).await.unwrap();
+            let pit_data = manager.download_pit().await.unwrap();
             // M3_EUR_OPEN_4G.pit has Mx-MDM, verifying PIT was sent and updated device state
             assert_eq!(pit_data.cpu_bl_id.to_string_lossy(), "Mx-MDM");
         });
@@ -1069,7 +1190,7 @@ mod tests {
                 .skip(&["boot.img", "VBMETA"]);
             let skipped_ids = manager.resolve_skipped_partitions(&pit_data).unwrap();
             let infos = manager
-                .build_partition_infos(&pit_data, Vec::new(), &skipped_ids)
+                .build_partition_infos(&pit_data, &[], &skipped_ids, true)
                 .await
                 .unwrap();
 
@@ -1150,7 +1271,7 @@ mod tests {
                 .partitions(partitions.into_iter().map(|r| (None, "part", r)))
                 .disable_verity(verity)
                 .disable_verification(verification)
-                .rewrite_vbmeta_payloads(pit_data, planned)
+                .rewrite_vbmeta_payloads(pit_data, planned, true)
                 .await
         })
     }
@@ -1376,5 +1497,373 @@ mod tests {
             run("invalid.tar", &invalid, true),
             Err(FlashError::VbmetaRewriteFailed(name, _)) if name == "VBMETA_A"
         ));
+    }
+
+    #[test]
+    fn test_execute_truncated_package_fails_before_device() {
+        let tar_bytes = build_tar(&[("boot.img", &[0xABu8; 1024])]);
+        let truncated = &tar_bytes[..600];
+
+        futures::executor::block_on(async {
+            let backend = MockBackend::new();
+            let events = backend.event_log();
+            let mut connection = OdinConnection::new(Box::new(backend));
+            connection.init().await.unwrap();
+            let mut session = connection.begin_session().await.unwrap();
+
+            let res = FlashManager::new(&mut session)
+                .erase(true)
+                .packages([("AP.tar", Cursor::new(truncated))])
+                .execute()
+                .await;
+
+            assert!(matches!(res, Err(FlashError::ArchiveCorrupted(pkg, _)) if pkg == "AP.tar"));
+            let logged = events.lock().unwrap();
+            assert!(
+                !logged.contains(&MockEvent::NandErase)
+                    && !logged.contains(&MockEvent::PitFlash)
+                    && !logged.iter().any(|e| matches!(e, MockEvent::Slice { .. })),
+                "no destructive operations should have occurred, got: {:?}",
+                *logged
+            );
+        });
+    }
+
+    #[test]
+    fn test_execute_bad_skip_target_does_not_erase() {
+        let tar_bytes = build_tar(&[("boot.img", b"DUMMY BOOT IMAGE DATA")]);
+
+        futures::executor::block_on(async {
+            let backend = MockBackend::new();
+            let events = backend.event_log();
+            let mut connection = OdinConnection::new(Box::new(backend));
+            connection.init().await.unwrap();
+            let mut session = connection.begin_session().await.unwrap();
+
+            let res = FlashManager::new(&mut session)
+                .erase(true)
+                .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
+                .skip(&["nonexistent_partition"])
+                .execute()
+                .await;
+
+            assert!(
+                matches!(res, Err(FlashError::SkipTargetNotFound(target)) if target == "nonexistent_partition")
+            );
+            let logged = events.lock().unwrap();
+            assert!(
+                !logged.contains(&MockEvent::NandErase),
+                "NandErase should not have occurred, got: {:?}",
+                *logged
+            );
+        });
+    }
+
+    #[test]
+    fn test_execute_invalid_vbmeta_does_not_flash_pit() {
+        let tar_bytes = build_tar(&[("vbmeta.img", &[0xFFu8; 512])]);
+        let pit_bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test-data/Q7MQ_EUR_OPENX.pit"
+        ));
+
+        futures::executor::block_on(async {
+            let backend = MockBackend::new();
+            let events = backend.event_log();
+            let mut connection = OdinConnection::new(Box::new(backend));
+            connection.init().await.unwrap();
+            let mut session = connection.begin_session().await.unwrap();
+
+            let res = FlashManager::new(&mut session)
+                .pit(&pit_bytes[..])
+                .erase(true)
+                .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
+                .disable_verity(true)
+                .execute()
+                .await;
+
+            assert!(
+                matches!(res, Err(FlashError::VbmetaRewriteFailed(name, _)) if name == "VBMETA_A")
+            );
+            let logged = events.lock().unwrap();
+            assert!(
+                !logged.contains(&MockEvent::PitFlash) && !logged.contains(&MockEvent::NandErase),
+                "PitFlash/NandErase should not have occurred, got: {:?}",
+                *logged
+            );
+        });
+    }
+
+    #[test]
+    fn test_execute_order_with_local_pit() {
+        let tar_bytes = build_tar(&[("boot.img", b"DUMMY BOOT IMAGE DATA")]);
+        let pit_bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test-data/Q7MQ_EUR_OPENX.pit"
+        ));
+
+        futures::executor::block_on(async {
+            let backend = MockBackend::new();
+            let events = backend.event_log();
+            let mut connection = OdinConnection::new(Box::new(backend));
+            connection.init().await.unwrap();
+            let mut session = connection.begin_session().await.unwrap();
+
+            FlashManager::new(&mut session)
+                .pit(&pit_bytes[..])
+                .erase(true)
+                .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
+                .execute()
+                .await
+                .unwrap();
+
+            let logged = events.lock().unwrap().clone();
+            assert!(logged.len() >= 4);
+            assert_eq!(logged[0], MockEvent::NandErase);
+            assert_eq!(logged[1], MockEvent::PitFlash);
+            assert_eq!(logged[2], MockEvent::PitDump);
+            assert!(matches!(logged[3], MockEvent::Slice { .. }));
+        });
+    }
+
+    #[test]
+    fn test_execute_order_without_local_pit() {
+        let tar_bytes = build_tar(&[("boot.img", b"DUMMY BOOT IMAGE DATA")]);
+
+        futures::executor::block_on(async {
+            let backend = MockBackend::new();
+            let events = backend.event_log();
+            let mut connection = OdinConnection::new(Box::new(backend));
+            connection.init().await.unwrap();
+            let mut session = connection.begin_session().await.unwrap();
+
+            FlashManager::new(&mut session)
+                .erase(true)
+                .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
+                .execute()
+                .await
+                .unwrap();
+
+            let logged = events.lock().unwrap().clone();
+            assert!(logged.len() >= 3);
+            assert_eq!(logged[0], MockEvent::PitDump);
+            assert_eq!(logged[1], MockEvent::NandErase);
+            assert!(matches!(logged[2], MockEvent::Slice { .. }));
+        });
+    }
+
+    #[test]
+    fn test_execute_invalid_local_pit_rejected_early() {
+        let tar_bytes = build_tar(&[("boot.img", b"DUMMY BOOT IMAGE DATA")]);
+
+        futures::executor::block_on(async {
+            let backend = MockBackend::new();
+            let events = backend.event_log();
+            let mut connection = OdinConnection::new(Box::new(backend));
+            connection.init().await.unwrap();
+            let mut session = connection.begin_session().await.unwrap();
+
+            let res = FlashManager::new(&mut session)
+                .pit(b"invalid_pit_bytes")
+                .erase(true)
+                .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
+                .execute()
+                .await;
+
+            assert!(matches!(res, Err(FlashError::PitUnpackFailed(_))));
+            let logged = events.lock().unwrap();
+            assert!(
+                logged.is_empty(),
+                "no operations should have occurred on invalid local pit, got: {:?}",
+                *logged
+            );
+        });
+    }
+
+    #[test]
+    fn test_execute_vbmeta_payload_flags() {
+        use std::io::Write;
+
+        let raw_vbmeta = crate::avb::tests::vbmeta_image(0);
+        let mut encoder = lz4_flex::frame::FrameEncoder::with_frame_info(
+            lz4_flex::frame::FrameInfo::new()
+                .content_size(Some(raw_vbmeta.len() as u64))
+                .block_size(lz4_flex::frame::BlockSize::Max1MB)
+                .block_mode(lz4_flex::frame::BlockMode::Independent),
+            Vec::new(),
+        );
+        encoder.write_all(&raw_vbmeta).unwrap();
+        let vbmeta_lz4 = encoder.finish().unwrap();
+
+        let tar_bytes = build_tar(&[("vbmeta.img.lz4", &vbmeta_lz4)]);
+
+        // 1. With --disable-verity and --disable-verification: sent raw, byte 123 is 0x03
+        futures::executor::block_on(async {
+            let backend = MockBackend::with_profile(crate::usb::DeviceProfile::sm_f968b());
+            let events = backend.event_log();
+            let mut connection = OdinConnection::new(Box::new(backend));
+            connection.init().await.unwrap();
+            let mut session = connection.begin_session().await.unwrap();
+
+            FlashManager::new(&mut session)
+                .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
+                .disable_verity(true)
+                .disable_verification(true)
+                .execute()
+                .await
+                .unwrap();
+
+            let logged = events.lock().unwrap().clone();
+            let slice = logged
+                .iter()
+                .find_map(|e| match e {
+                    MockEvent::Slice { lz4, data, .. } => Some((*lz4, data)),
+                    _ => None,
+                })
+                .expect("vbmeta slice");
+
+            assert!(!slice.0, "rewritten vbmeta must be sent raw (uncompressed)");
+            // Only the flags field (big endian u32 at offset 120) changes
+            let mut expected = raw_vbmeta.clone();
+            expected[123] = 0x03;
+            assert_eq!(slice.1, &expected);
+        });
+
+        // 2. Without flags: payload matches input exactly for raw, and lz4 passthrough is preserved for lz4
+        futures::executor::block_on(async {
+            let raw_tar = build_tar(&[("vbmeta.img", &raw_vbmeta)]);
+            let backend = MockBackend::with_profile(crate::usb::DeviceProfile::sm_f968b());
+            let events = backend.event_log();
+            let mut connection = OdinConnection::new(Box::new(backend));
+            connection.init().await.unwrap();
+            let mut session = connection.begin_session().await.unwrap();
+
+            FlashManager::new(&mut session)
+                .packages([("AP.tar", Cursor::new(raw_tar.as_slice()))])
+                .execute()
+                .await
+                .unwrap();
+
+            let logged = events.lock().unwrap().clone();
+            let slice = logged
+                .iter()
+                .find_map(|e| match e {
+                    MockEvent::Slice { lz4, data, .. } => Some((*lz4, data)),
+                    _ => None,
+                })
+                .expect("vbmeta slice");
+
+            assert!(!slice.0);
+            assert_eq!(slice.1, &raw_vbmeta);
+        });
+
+        // 3. Without flags on LZ4 input: lz4 passthrough is preserved
+        futures::executor::block_on(async {
+            let backend = MockBackend::with_profile(crate::usb::DeviceProfile::sm_f968b());
+            let events = backend.event_log();
+            let mut connection = OdinConnection::new(Box::new(backend));
+            connection.init().await.unwrap();
+            let mut session = connection.begin_session().await.unwrap();
+
+            FlashManager::new(&mut session)
+                .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
+                .execute()
+                .await
+                .unwrap();
+
+            let logged = events.lock().unwrap().clone();
+            let slice = logged
+                .iter()
+                .find_map(|e| match e {
+                    MockEvent::Slice { lz4, data, .. } => Some((*lz4, data)),
+                    _ => None,
+                })
+                .expect("vbmeta slice");
+
+            assert!(slice.0, "unmodified vbmeta must preserve LZ4 passthrough");
+            // Passthrough sends the LZ4 blocks between the 15 byte frame header and the EndMark
+            assert_eq!(slice.1, &vbmeta_lz4[15..vbmeta_lz4.len() - 4]);
+        });
+    }
+
+    #[test]
+    fn test_package_flash_files_filtering_and_truncation() {
+        let manifest = b"boot.img\nsuper.img\n";
+        let pit_bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test-data/M3_EUR_OPEN_4G.pit"
+        ));
+        let tar_bytes = build_tar(&[
+            ("meta-data/download-list.txt", manifest),
+            ("meta-data/super_used_size.txt", b"12345\n"),
+            ("device.pit", pit_bytes),
+            ("boot.img.lz4", b"BOOT DATA"),
+            ("recovery.img.lz4", b"RECOVERY DATA"),
+        ]);
+
+        futures::executor::block_on(async {
+            let mut packages = vec![("AP.tar".to_string(), Cursor::new(tar_bytes.as_slice()))];
+            let files = package_flash_files(&mut packages).await.unwrap();
+            // recovery.img is omitted (not in download-list), metadata & pit are omitted
+            assert_eq!(files, ["boot.img"]);
+
+            // Truncated package errors on scan
+            let truncated = &tar_bytes[..tar_bytes.len() - 600];
+            let mut bad_packages = vec![("AP.tar".to_string(), Cursor::new(truncated))];
+            let res = package_flash_files(&mut bad_packages).await;
+            assert!(matches!(res, Err(FlashError::ArchiveCorrupted(pkg, _)) if pkg == "AP.tar"));
+        });
+    }
+
+    #[test]
+    fn test_execute_with_local_pit_reports_once() {
+        #[derive(Clone, Default)]
+        struct Collector(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+        impl crate::FlashProgress for Collector {
+            fn println(&self, msg: &str) {
+                self.0.lock().unwrap().push(msg.to_string());
+            }
+        }
+
+        let _guard = crate::progress::TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let tar_bytes = build_tar(&[
+            ("boot.img", b"DUMMY BOOT IMAGE DATA"),
+            ("dtbo.img", b"DUMMY DTBO IMAGE DATA"),
+        ]);
+        let pit_bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test-data/Q7MQ_EUR_OPENX.pit"
+        ));
+
+        let collector = Collector::default();
+        crate::progress::set_progress(collector.clone());
+        let res = futures::executor::block_on(async {
+            let backend = Box::new(MockBackend::new());
+            let mut connection = OdinConnection::new(backend);
+            connection.init().await.unwrap();
+            let mut session = connection.begin_session().await.unwrap();
+
+            // The plan is checked against the local PIT and then rebuilt against the
+            // flashed PIT, but informational messages must only be printed once
+            FlashManager::new(&mut session)
+                .pit(&pit_bytes[..])
+                .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
+                .skip(&["DTBO"])
+                .execute()
+                .await
+        });
+        crate::progress::clear_progress();
+        res.unwrap();
+
+        let messages = collector.0.lock().unwrap();
+        let count = messages
+            .iter()
+            .filter(|m| m.as_str() == "Skipping DTBO_A (excluded with --skip)")
+            .count();
+        assert_eq!(count, 1, "messages: {:?}", *messages);
     }
 }

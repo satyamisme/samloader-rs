@@ -169,6 +169,22 @@ pub(crate) enum SliceCommit {
 }
 
 impl SliceCommit {
+    #[cfg(any(feature = "mock", debug_assertions))]
+    pub(crate) fn partition_id(&self) -> u32 {
+        match self {
+            Self::Unified { partition_id, .. } => *partition_id,
+            Self::LegacyModem { partition_id, .. } => *partition_id,
+        }
+    }
+
+    #[cfg(any(feature = "mock", debug_assertions))]
+    pub(crate) fn slice_size(&self) -> u32 {
+        match self {
+            Self::Unified { slice_size, .. } => *slice_size,
+            Self::LegacyModem { slice_size, .. } => *slice_size,
+        }
+    }
+
     pub(crate) fn new(
         slice_size: u32,
         pit_entry: &PitEntry,

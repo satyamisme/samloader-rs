@@ -127,7 +127,7 @@ mod nusb;
 
 #[cfg(any(feature = "mock", debug_assertions))]
 #[allow(unused_imports)]
-pub use mock::{DeviceProfile, DeviceProfileBuilder, MockBackend};
+pub use mock::{DeviceProfile, DeviceProfileBuilder, MockBackend, MockEvent};
 
 #[cfg(any(feature = "mock", debug_assertions))]
 mod mock;
