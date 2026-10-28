@@ -78,6 +78,31 @@ impl<'a, EpType: BulkOrInterrupt, Dir: EndpointDirection> Future
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+async fn drain_pending<EpType: BulkOrInterrupt, Dir: EndpointDirection>(
+    ep: &mut ::nusb::Endpoint<EpType, Dir>,
+) -> Result<(), ()> {
+    ep.cancel_all();
+    while ep.pending() > 0 {
+        let mut delay = Delay::new(Duration::from_secs(1));
+        let completed = futures::future::poll_fn(|cx| {
+            if let Poll::Ready(_completion) = ep.poll_next_complete(cx) {
+                Poll::Ready(true)
+            } else if Pin::new(&mut delay).poll(cx).is_ready() {
+                Poll::Ready(false)
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+
+        if !completed {
+            return Err(());
+        }
+    }
+    Ok(())
+}
+
 #[cfg(target_arch = "wasm32")]
 async fn wait_pending<EpType: BulkOrInterrupt, Dir: EndpointDirection>(
     ep: &mut ::nusb::Endpoint<EpType, Dir>,
@@ -97,27 +122,36 @@ async fn transfer_async<EpType: BulkOrInterrupt, Dir: EndpointDirection>(
     timeout: Duration,
 ) -> Completion {
     #[cfg(not(target_arch = "wasm32"))]
-    let submit_now = {
-        assert_eq!(ep.pending(), 0, "a transfer is already pending");
-        true
-    };
+    {
+        if ep.pending() > 0 && drain_pending(ep).await.is_err() {
+            return Completion {
+                buffer: buf,
+                actual_len: 0,
+                status: Err(::nusb::transfer::TransferError::Cancelled),
+            };
+        }
+        ep.submit(buf);
+        TransferFuture {
+            ep,
+            delay: Delay::new(timeout),
+            cancelled: false,
+        }
+        .await
+    }
     #[cfg(target_arch = "wasm32")]
-    let submit_now = ep.pending() == 0;
-
-    let mut pending_buf = Some(buf);
-    if submit_now && let Some(b) = pending_buf.take() {
-        ep.submit(b);
+    {
+        let submit_now = ep.pending() == 0;
+        let mut pending_buf = Some(buf);
+        if submit_now && let Some(b) = pending_buf.take() {
+            ep.submit(b);
+        }
+        TransferFuture {
+            ep,
+            delay: Delay::new(timeout),
+            pending_buf,
+        }
+        .await
     }
-
-    TransferFuture {
-        ep,
-        delay: Delay::new(timeout),
-        #[cfg(not(target_arch = "wasm32"))]
-        cancelled: false,
-        #[cfg(target_arch = "wasm32")]
-        pending_buf,
-    }
-    .await
 }
 
 /// USB communication backend using `nusb`.
