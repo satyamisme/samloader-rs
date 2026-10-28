@@ -1577,7 +1577,6 @@ dependencies = [
  "samloader-fus",
  "samloader-odin",
  "samloader-pit",
- "tar",
 ]
 
 [[package]]

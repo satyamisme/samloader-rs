@@ -21,11 +21,10 @@ use samloader_odin::{
     FlashEvent, FlashManager, FlashProgress, OdinConnection, RebootMode, UsbBackendOption,
     create_backend,
     futures::{executor::block_on, io::AllowStdIo},
-    set_progress,
+    package_flash_files, set_progress,
 };
-use std::collections::HashSet;
 use std::fs::File;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::Path;
 use std::time::Duration;
 
@@ -138,38 +137,14 @@ fn normalize_basename(path: &str) -> String {
     }
 }
 
-// Lists the file names that will be flashed from packages, honoring download-list.txt
-fn package_flash_names(packages: &[String]) -> io::Result<Vec<String>> {
-    let mut names = Vec::new();
-    let mut download_list: Option<HashSet<String>> = None;
-    for pkg in packages {
-        let mut archive = tar::Archive::new(File::open(pkg)?);
-        for entry in archive.entries_with_seek()? {
-            let mut entry = entry?;
-            let name = normalize_basename(&entry.path()?.to_string_lossy());
-            if name == "download-list.txt" {
-                let mut content = String::new();
-                entry.read_to_string(&mut content)?;
-                download_list = Some(content.lines().map(|s| s.trim().to_string()).collect());
-            } else {
-                names.push(name);
-            }
-        }
-    }
-    if let Some(list) = download_list {
-        names.retain(|name| list.contains(name));
-    }
-    Ok(names)
-}
-
 // Checks whether userdata is flashed before talking to the device, so without its PIT.
 // Packages and auto-matched files are checked by file name, and explicit partitions by
 // partition name. Partitions given by numeric ID cannot be resolved and are not checked.
 fn flashes_userdata(
-    packages: &[String],
+    package_files: &[String],
     partitions: &[PartitionArg],
     skip: &[String],
-) -> io::Result<bool> {
+) -> bool {
     let is_skipped = |name: &str| {
         skip.iter().any(|target| {
             let target = target.trim();
@@ -178,16 +153,16 @@ fn flashes_userdata(
         })
     };
 
-    let mut names = package_flash_names(packages)?;
+    let mut names = package_files.to_vec();
     for part in partitions {
         names.push(match &part.name {
             Some(name) => name.clone(),
             None => normalize_basename(&part.filename),
         });
     }
-    Ok(names
+    names
         .iter()
-        .any(|name| name.to_ascii_lowercase().starts_with("userdata") && !is_skipped(name)))
+        .any(|name| name.to_ascii_lowercase().starts_with("userdata") && !is_skipped(name))
 }
 
 // Asks a y/n question on the terminal, declining when stdin is closed
@@ -229,18 +204,37 @@ pub(crate) fn action_flash(
     force: bool,
 ) -> i32 {
     if !force {
-        match flashes_userdata(packages, partitions, skip) {
-            Ok(false) => {}
-            Ok(true) => {
-                if !confirm(
-                    "Flash list contains userdata. This will wipe the device's data. Continue?",
-                ) {
-                    print_error!("Flashing aborted by user.");
+        let mut check_packages = Vec::with_capacity(packages.len());
+        for pkg in packages {
+            let file = match File::open(pkg) {
+                Ok(f) => f,
+                Err(e) => {
+                    print_error!("Failed to open file \"{}\": {}", pkg, e);
                     return 1;
                 }
-            }
+            };
+            check_packages.push((pkg.clone(), AllowStdIo::new(file)));
+        }
+
+        let package_files = match block_on(package_flash_files(&mut check_packages)) {
+            Ok(files) => files,
             Err(e) => {
-                print_error!("Failed to read packages: {}", e);
+                print_error!("{}", e);
+                return 1;
+            }
+        };
+
+        if flashes_userdata(&package_files, partitions, skip) {
+            if !io::stdin().is_terminal() {
+                print_error!(
+                    "Flash list contains userdata, which will wipe the device's data. \
+                     Pass --force to flash it without a terminal."
+                );
+                return 1;
+            }
+            if !confirm("Flash list contains userdata. This will wipe the device's data. Continue?")
+            {
+                print_error!("Flashing aborted by user.");
                 return 1;
             }
         }
