@@ -15,11 +15,13 @@
 use crate::progress::FlashEvent;
 use fast_md5::Md5;
 use futures::StreamExt;
-use futures::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt};
+use futures::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, Cursor};
 use futures::stream::{self, Stream};
 use samloader_pit::PitEntry;
 use std::borrow::Cow;
 use std::io::{self, SeekFrom};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 // This is asserted by Lz4FrameHeader so the header size is always 15
 const LZ4_HEADER_SIZE: usize = 15;
@@ -215,153 +217,237 @@ impl Lz4FrameHeader {
     }
 }
 
-/// An uncompressed firmware file payload.
-pub(crate) struct FirmwareFile<'a, R> {
-    /// PIT partition entry associated with this file.
-    pub(crate) pit_entry: &'a PitEntry,
-    /// Asynchronous reader for the file content payload.
-    pub(crate) file: R,
-    /// Total size of the file in bytes.
-    pub(crate) size: u64,
+/// Backing byte source for a planned partition payload.
+///
+/// Rather than owning or holding a mutable borrow of a reader directly, `Package` and
+/// `Image` store indices into [`FlashManager`](crate::FlashManager)'s `packages` and
+/// `partitions` lists. Multiple planned partitions typically originate from the same
+/// TAR archive, and reading requires `&mut R`, so Rust's borrow rules prevent multiple
+/// [`FirmwarePartitionPayload`] items from simultaneously holding `&mut R` references to
+/// the same underlying archive reader. Storing the index allows
+/// [`FirmwarePartitionSource::open_reader`] to borrow and seek the appropriate reader on
+/// demand one partition at a time.
+pub(crate) enum FirmwarePartitionSource {
+    /// Entry inside a TAR package archive.
+    Package {
+        /// Index into `FlashManager::packages`.
+        index: usize,
+        /// Byte offset where the entry's payload starts within the TAR archive.
+        offset: u64,
+        /// Raw byte length of the entry in the TAR archive.
+        size: u64,
+    },
+    /// Standalone partition image.
+    Image {
+        /// Index into `FlashManager::partitions`.
+        index: usize,
+        /// Total byte length of the standalone partition image.
+        size: u64,
+    },
+    /// In-memory byte buffer (e.g. rewritten vbmeta image).
+    Memory(Vec<u8>),
 }
 
-impl<'a, R: AsyncRead + AsyncSeek + Unpin> FirmwareFile<'a, R> {
-    pub(crate) fn slices(
-        &mut self,
-        slice_max_bytes: usize,
-    ) -> impl Stream<Item = io::Result<Vec<u8>>> + '_ {
-        stream::unfold(
-            (&mut self.file, self.size, false),
-            move |(reader, mut remaining, mut started)| async move {
-                if remaining == 0 {
-                    return None;
-                }
-                if !started {
-                    if let Err(e) = reader.seek(SeekFrom::Start(0)).await {
-                        return Some((Err(e), (reader, 0, true)));
-                    }
-                    started = true;
-                }
-                let to_read = remaining.min(slice_max_bytes as u64) as usize;
-                let mut buffer = vec![0u8; to_read];
-                if let Err(e) = reader.read_exact(&mut buffer).await {
-                    return Some((Err(e), (reader, 0, started)));
-                }
-                remaining -= to_read as u64;
-                Some((Ok(buffer), (reader, remaining, started)))
-            },
-        )
-    }
-}
-
-/// An LZ4-compressed firmware file payload.
-pub(crate) struct FirmwareLz4File<'a, R> {
-    /// PIT partition entry associated with this file.
-    pub(crate) pit_entry: &'a PitEntry,
-    /// Asynchronous reader for the file content payload.
-    pub(crate) file: R,
-    /// Total size of the compressed file in bytes.
-    pub(crate) size: u64,
-    /// Metadata header of the LZ4 frame.
-    pub(crate) header: Lz4FrameHeader,
-}
-
-impl<'a, R: AsyncRead + AsyncSeek + Unpin> FirmwareLz4File<'a, R> {
-    pub(crate) fn slices(
-        &mut self,
-        slice_max_bytes: usize,
-    ) -> impl Stream<Item = io::Result<(usize, Vec<u8>)>> + '_ {
-        let iter = Lz4SliceIterator {
-            reader: &mut self.file,
-            max_blocks: slice_max_bytes / (1024 * 1024),
-            remaining_decompressed: self.header.content_size,
-            started: false,
-            finished: false,
-        };
-        stream::unfold(iter, |mut it| async move {
-            it.next_slice().await.map(|item| (item, it))
-        })
-    }
-
-    pub(crate) fn decompressed_slices(
-        &mut self,
-        slice_max_bytes: usize,
-    ) -> impl Stream<Item = io::Result<Vec<u8>>> + '_ {
-        let iter = Lz4DecompressedSliceIterator {
-            reader: &mut self.file,
-            block_max_size: self.header.block_max_size as usize,
-            slice_max_bytes,
-            leftover: Vec::new(),
-            started: false,
-            finished: false,
-        };
-        stream::unfold(iter, |mut it| async move {
-            it.next_slice().await.map(|item| (item, it))
-        })
-    }
-}
-
-/// Enum wrapping a firmware file payload variant.
-pub(crate) enum FirmwareInfo<'a, R> {
-    /// Uncompressed normal firmware file payload.
-    Normal(FirmwareFile<'a, R>),
-    /// LZ4-compressed firmware file payload.
-    Lz4(FirmwareLz4File<'a, R>),
-}
-
-impl<'a, R> FirmwareInfo<'a, R> {
-    /// Returns the PIT partition entry associated with this payload.
-    pub(crate) fn pit_entry(&self) -> &'a PitEntry {
+impl FirmwarePartitionSource {
+    /// Returns the raw byte length of the payload in its backing source.
+    pub(crate) fn size(&self) -> u64 {
         match self {
-            FirmwareInfo::Normal(f) => f.pit_entry,
-            FirmwareInfo::Lz4(f) => f.pit_entry,
+            Self::Package { size, .. } | Self::Image { size, .. } => *size,
+            Self::Memory(data) => data.len() as u64,
+        }
+    }
+
+    /// Positions and returns a size-bounded reader at the start of this partition's payload.
+    pub(crate) async fn open_reader<
+        'a,
+        P: AsyncRead + AsyncSeek + Unpin,
+        I: AsyncRead + AsyncSeek + Unpin,
+    >(
+        &'a self,
+        packages: &'a mut [(String, P)],
+        partitions: &'a mut [(Option<String>, String, I)],
+    ) -> io::Result<impl AsyncRead + Unpin + 'a> {
+        let reader = match self {
+            Self::Package { index, offset, .. } => {
+                let reader = &mut packages[*index].1;
+                reader.seek(SeekFrom::Start(*offset)).await?;
+                SourceReader::Package(reader)
+            }
+            Self::Image { index, .. } => {
+                let reader = &mut partitions[*index].2;
+                reader.seek(SeekFrom::Start(0)).await?;
+                SourceReader::Image(reader)
+            }
+            Self::Memory(data) => SourceReader::Memory(Cursor::new(data.as_slice())),
+        };
+        Ok(reader.take(self.size()))
+    }
+}
+
+enum SourceReader<'a, P, I> {
+    Package(&'a mut P),
+    Image(&'a mut I),
+    Memory(Cursor<&'a [u8]>),
+}
+
+impl<P: AsyncRead + Unpin, I: AsyncRead + Unpin> AsyncRead for SourceReader<'_, P, I> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        match &mut *self {
+            Self::Package(r) => Pin::new(r).poll_read(cx, buf),
+            Self::Image(r) => Pin::new(r).poll_read(cx, buf),
+            Self::Memory(c) => Pin::new(c).poll_read(cx, buf),
         }
     }
 }
 
-impl<'a, R: AsyncRead + AsyncSeek + Unpin> FirmwareInfo<'a, R> {
+/// A resolved partition payload ready to be inspected or flashed to the device.
+pub(crate) struct FirmwarePartitionPayload<'a> {
+    /// PIT partition entry associated with this payload.
+    pub(crate) pit_entry: &'a PitEntry,
+    /// Backing source for the payload bytes.
+    pub(crate) source: FirmwarePartitionSource,
+    /// Metadata header of the LZ4 frame if the payload is LZ4-compressed.
+    pub(crate) lz4_header: Option<Lz4FrameHeader>,
+}
+
+impl<'a> FirmwarePartitionPayload<'a> {
+    /// Total raw size of the payload in bytes in its backing source.
+    pub(crate) fn size(&self) -> u64 {
+        self.source.size()
+    }
+
+    /// Total uncompressed size of the payload in bytes.
+    pub(crate) fn uncompressed_size(&self) -> u64 {
+        self.lz4_header
+            .as_ref()
+            .map_or_else(|| self.size(), |h| h.content_size)
+    }
+
+    /// Streams raw slices of an uncompressed partition payload.
+    pub(crate) fn slices<'r, R: AsyncRead + Unpin>(
+        &self,
+        reader: &'r mut R,
+        slice_max_bytes: usize,
+    ) -> impl Stream<Item = io::Result<Vec<u8>>> + 'r {
+        stream::unfold(
+            (reader, self.size()),
+            move |(reader, mut remaining)| async move {
+                if remaining == 0 {
+                    return None;
+                }
+                let to_read = remaining.min(slice_max_bytes as u64) as usize;
+                let mut buffer = vec![0u8; to_read];
+                if let Err(e) = reader.read_exact(&mut buffer).await {
+                    return Some((Err(e), (reader, 0)));
+                }
+                remaining -= to_read as u64;
+                Some((Ok(buffer), (reader, remaining)))
+            },
+        )
+    }
+
+    /// Streams LZ4-compressed block slices along with their uncompressed byte sizes.
+    pub(crate) fn compressed_slices<'r, R: AsyncRead + Unpin>(
+        &self,
+        reader: &'r mut R,
+        slice_max_bytes: usize,
+    ) -> impl Stream<Item = io::Result<(usize, Vec<u8>)>> + 'r {
+        let (block_max_size, remaining_decompressed) = self
+            .lz4_header
+            .as_ref()
+            .map_or((0, 0), |h| (h.block_max_size as usize, h.content_size));
+        let max_blocks = slice_max_bytes
+            .checked_div(block_max_size)
+            .map_or(0, |n| n.max(1));
+        let iter = Lz4SliceIterator {
+            reader,
+            block_max_size,
+            max_blocks,
+            remaining_decompressed,
+            started: false,
+            finished: block_max_size == 0,
+        };
+        stream::unfold(iter, |mut it| async move {
+            it.next_slice().await.map(|item| (item, it))
+        })
+    }
+
+    /// Streams decompressed byte slices from an LZ4-compressed partition payload.
+    pub(crate) fn decompressed_slices<'r, R: AsyncRead + Unpin>(
+        &self,
+        reader: &'r mut R,
+        slice_max_bytes: usize,
+    ) -> impl Stream<Item = io::Result<Vec<u8>>> + 'r {
+        let block_max_size = self
+            .lz4_header
+            .as_ref()
+            .map_or(0, |h| h.block_max_size as usize);
+        let iter = Lz4DecompressedSliceIterator {
+            reader,
+            block_max_size,
+            slice_max_bytes,
+            leftover: Vec::new(),
+            started: false,
+            finished: block_max_size == 0,
+        };
+        stream::unfold(iter, |mut it| async move {
+            it.next_slice().await.map(|item| (item, it))
+        })
+    }
+
     /// Reads the entire payload content, decompressing it if needed.
-    pub(crate) async fn read_all(&mut self) -> io::Result<Vec<u8>> {
-        match self {
-            FirmwareInfo::Normal(f) => {
-                f.file.seek(SeekFrom::Start(0)).await?;
-                let mut data = vec![0u8; f.size as usize];
-                f.file.read_exact(&mut data).await?;
-                Ok(data)
+    pub(crate) async fn read_all<R: AsyncRead + Unpin>(
+        &self,
+        reader: &mut R,
+    ) -> io::Result<Vec<u8>> {
+        if let Some(header) = &self.lz4_header {
+            let mut data = Vec::new();
+            let content_size = header.content_size;
+            let slice_size = (header.block_max_size as usize).max(64 * 1024);
+            let mut slices = std::pin::pin!(self.decompressed_slices(reader, slice_size));
+            while let Some(slice) = slices.next().await {
+                data.extend_from_slice(&slice?);
             }
-            FirmwareInfo::Lz4(f) => {
-                let mut data = Vec::new();
-                let content_size = f.header.content_size;
-                let slice_size = (f.header.block_max_size as usize).max(64 * 1024);
-                let mut slices = std::pin::pin!(f.decompressed_slices(slice_size));
-                while let Some(slice) = slices.next().await {
-                    data.extend_from_slice(&slice?);
-                }
-                if data.len() as u64 != content_size {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "LZ4 content size mismatch: expected {}, got {}",
-                            content_size,
-                            data.len()
-                        ),
-                    ));
-                }
-                Ok(data)
+            if data.len() as u64 != content_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "LZ4 content size mismatch: expected {}, got {}",
+                        content_size,
+                        data.len()
+                    ),
+                ));
             }
+            Ok(data)
+        } else {
+            let size = self.size();
+            let mut data = Vec::new();
+            reader.take(size).read_to_end(&mut data).await?;
+            if data.len() as u64 != size {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "unexpected EOF while reading partition payload",
+                ));
+            }
+            Ok(data)
         }
     }
 }
 
 struct Lz4SliceIterator<'r, R> {
     reader: &'r mut R,
+    block_max_size: usize,
     max_blocks: usize,
     remaining_decompressed: u64,
     started: bool,
     finished: bool,
 }
 
-impl<'r, R: AsyncRead + AsyncSeek + Unpin> Lz4SliceIterator<'r, R> {
+impl<'r, R: AsyncRead + Unpin> Lz4SliceIterator<'r, R> {
     async fn next_slice(&mut self) -> Option<io::Result<(usize, Vec<u8>)>> {
         match self.try_next_slice().await {
             Ok(Some(slice)) => Some(Ok(slice)),
@@ -378,9 +464,8 @@ impl<'r, R: AsyncRead + AsyncSeek + Unpin> Lz4SliceIterator<'r, R> {
             return Ok(None);
         }
         if !self.started {
-            self.reader
-                .seek(SeekFrom::Start(LZ4_HEADER_SIZE as u64))
-                .await?;
+            let mut header = [0u8; LZ4_HEADER_SIZE];
+            self.reader.read_exact(&mut header).await?;
             self.started = true;
         }
 
@@ -398,6 +483,15 @@ impl<'r, R: AsyncRead + AsyncSeek + Unpin> Lz4SliceIterator<'r, R> {
             }
 
             let data_size = (block_size & 0x7FFF_FFFF) as usize;
+            if data_size > self.block_max_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "LZ4 block size {} exceeds max block size {}",
+                        data_size, self.block_max_size
+                    ),
+                ));
+            }
             let start = buffer.len();
             buffer.resize(start + 4 + data_size, 0);
             buffer[start..start + 4].copy_from_slice(&size_bytes);
@@ -412,7 +506,7 @@ impl<'r, R: AsyncRead + AsyncSeek + Unpin> Lz4SliceIterator<'r, R> {
 
         let decompressed_size = std::cmp::min(
             self.remaining_decompressed,
-            (num_blocks as u64) * 1024 * 1024,
+            (num_blocks as u64) * (self.block_max_size as u64),
         ) as usize;
         self.remaining_decompressed -= decompressed_size as u64;
 
@@ -430,7 +524,7 @@ struct Lz4DecompressedSliceIterator<'r, R> {
     finished: bool,
 }
 
-impl<'r, R: AsyncRead + AsyncSeek + Unpin> Lz4DecompressedSliceIterator<'r, R> {
+impl<'r, R: AsyncRead + Unpin> Lz4DecompressedSliceIterator<'r, R> {
     async fn next_slice(&mut self) -> Option<io::Result<Vec<u8>>> {
         match self.try_next_slice().await {
             Ok(Some(slice)) => Some(Ok(slice)),
@@ -448,9 +542,8 @@ impl<'r, R: AsyncRead + AsyncSeek + Unpin> Lz4DecompressedSliceIterator<'r, R> {
             return Ok(None);
         }
         if !self.started {
-            self.reader
-                .seek(SeekFrom::Start(LZ4_HEADER_SIZE as u64))
-                .await?;
+            let mut header = [0u8; LZ4_HEADER_SIZE];
+            self.reader.read_exact(&mut header).await?;
             self.started = true;
         }
 
@@ -475,6 +568,15 @@ impl<'r, R: AsyncRead + AsyncSeek + Unpin> Lz4DecompressedSliceIterator<'r, R> {
 
             let is_uncompressed = (block_size & 0x8000_0000) != 0;
             let data_size = (block_size & 0x7FFF_FFFF) as usize;
+            if data_size > self.block_max_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "LZ4 block size {} exceeds max block size {}",
+                        data_size, self.block_max_size
+                    ),
+                ));
+            }
             block_buf.resize(data_size, 0);
             self.reader.read_exact(&mut block_buf).await?;
 
@@ -662,26 +764,43 @@ mod tests {
             assert_eq!(header.content_size, original.len() as u64);
             assert_eq!(header.block_max_size, 64 * 1024);
 
-            let mut lz4_file = FirmwareLz4File {
+            let planned = FirmwarePartitionPayload {
                 pit_entry: &pit_entry,
-                file: cursor,
-                size: compressed.len() as u64,
-                header,
+                source: FirmwarePartitionSource::Image {
+                    index: 0,
+                    size: compressed.len() as u64,
+                },
+                lz4_header: Some(header),
             };
+            let mut packages: [(String, Cursor<&[u8]>); 0] = [];
+            let mut partitions = [(None, "test.img.lz4".to_string(), cursor)];
 
-            // 1. Read a partial prefix and drop the stream (simulating inspect_super_firmware_info)
-            let prefix = std::pin::pin!(lz4_file.decompressed_slices(10 * 1024))
-                .next()
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(prefix, &original[..10 * 1024]);
+            // 1. Read a partial prefix and drop the stream (simulating inspect_super_partition)
+            {
+                let mut reader = planned
+                    .source
+                    .open_reader(&mut packages, &mut partitions)
+                    .await
+                    .unwrap();
+                let prefix = std::pin::pin!(planned.decompressed_slices(&mut reader, 10 * 1024))
+                    .next()
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(prefix, &original[..10 * 1024]);
+            }
 
             // 2. Consume full stream with a 50 KB slice limit (unaligned with 64 KB blocks,
-            // exercising both SeekFrom::Start(LZ4_HEADER_SIZE) rewind and leftover buffering)
+            // exercising both open_reader rewind and leftover buffering)
             let mut reassembled = Vec::new();
             {
-                let mut slices = std::pin::pin!(lz4_file.decompressed_slices(50 * 1024));
+                let mut reader = planned
+                    .source
+                    .open_reader(&mut packages, &mut partitions)
+                    .await
+                    .unwrap();
+                let mut slices =
+                    std::pin::pin!(planned.decompressed_slices(&mut reader, 50 * 1024));
                 while let Some(res) = slices.next().await {
                     let slice = res.unwrap();
                     assert!(slice.len() <= 50 * 1024);
@@ -692,10 +811,11 @@ mod tests {
 
             // 3. Truncated LZ4 stream must yield Err rather than silently ending with Ok
             let truncated = &compressed[..compressed.len() - 10];
-            lz4_file.file = futures::io::Cursor::new(truncated);
-            lz4_file.size = truncated.len() as u64;
-            let results: Vec<io::Result<Vec<u8>>> =
-                lz4_file.decompressed_slices(50 * 1024).collect().await;
+            let mut truncated_reader = futures::io::Cursor::new(truncated);
+            let results: Vec<io::Result<Vec<u8>>> = planned
+                .decompressed_slices(&mut truncated_reader, 50 * 1024)
+                .collect()
+                .await;
             assert!(results.iter().any(|r| r.is_err()));
         });
     }

@@ -217,17 +217,9 @@ pub enum FlashError {
     #[error("Odin error: {0}")]
     Odin(#[from] OdinError),
 
-    /// Failed to open a file.
-    #[error("Failed to open file \"{0}\": {1}")]
-    FileOpenFailed(String, #[source] std::io::Error),
-
     /// Failed to read from a file.
     #[error("Failed to read file \"{0}\": {1}")]
     FileReadFailed(String, #[source] std::io::Error),
-
-    /// Failed to memory-map a file.
-    #[error("Failed to memory map file \"{0}\": {1}")]
-    MmapFailed(String, #[source] std::io::Error),
 
     /// Failed to parse an LZ4 frame header.
     #[error("Failed to parse LZ4 header for \"{0}\": {1}")]

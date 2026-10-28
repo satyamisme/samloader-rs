@@ -1603,7 +1603,6 @@ dependencies = [
  "futures",
  "futures-timer",
  "lz4_flex",
- "memmap2",
  "nusb",
  "rusb",
  "samloader-pit",

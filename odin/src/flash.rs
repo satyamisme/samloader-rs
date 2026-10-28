@@ -17,48 +17,25 @@
 use crate::FlashError;
 use crate::avb;
 use crate::firmware::{
-    FirmwareFile, FirmwareInfo, FirmwareLz4File, Lz4FrameHeader, verify_md5_footer,
+    FirmwarePartitionPayload, FirmwarePartitionSource, Lz4FrameHeader, verify_md5_footer,
 };
-use crate::lp::inspect_super_firmware_info;
+use crate::lp::inspect_super_partition;
 use crate::odin::OdinSession;
 use crate::progress::{self, FlashEvent};
 use crate::tar::TarArchive;
-use futures::io::{AllowStdIo, AsyncRead, AsyncReadExt, AsyncSeek, Cursor};
-use memmap2::{Mmap, MmapOptions};
+use futures::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, Cursor};
 use samloader_pit::{PitData, PitEntry};
 use std::collections::HashSet;
-use std::fs::File;
-use std::io::Read;
+use std::io::{self, SeekFrom};
 use std::path::Path;
 
-struct IndexedEntry<'a> {
+struct IndexedEntry {
     original_name: String,
     normalized_name: String,
-    file: &'a File,
+    package_index: usize,
     offset: u64,
     size: u64,
     is_lz4: bool,
-}
-
-impl<'a> IndexedEntry<'a> {
-    fn map(&self) -> Result<Mmap, FlashError> {
-        // SAFETY: The archive file is opened read-only and is assumed not to be
-        // concurrently modified or truncated during the flashing operation.
-        let mmap = unsafe {
-            MmapOptions::new()
-                .offset(self.offset)
-                .len(self.size as usize)
-                .map(self.file)
-        }
-        .map_err(|e| FlashError::MmapFailed(self.original_name.clone(), e))?;
-        Ok(mmap)
-    }
-}
-
-fn anon_mmap(data: &[u8]) -> std::io::Result<Mmap> {
-    let mut mapping = MmapOptions::new().len(data.len()).map_anon()?;
-    mapping.copy_from_slice(data);
-    mapping.make_read_only()
 }
 
 fn normalize_basename(path_str: &str) -> (String, bool) {
@@ -123,56 +100,6 @@ fn is_skip_target(entry: &PitEntry, target: &str) -> bool {
         .any(|slot| name.eq_ignore_ascii_case(&format!("{}{}", target, slot)))
 }
 
-async fn create_firmware_info<'a, R: AsyncRead + AsyncSeek + Unpin>(
-    mut file: R,
-    source_size: u64,
-    is_lz4_suffix: bool,
-    pit_entry: &'a PitEntry,
-    skip_size_check: bool,
-    file_display_name: &str,
-) -> Result<FirmwareInfo<'a, R>, FlashError> {
-    let lz4_frame_header = if is_lz4_suffix {
-        match Lz4FrameHeader::parse(&mut file).await {
-            Ok(fh) => Some(fh),
-            Err(e) => {
-                return Err(FlashError::Lz4Header(file_display_name.to_string(), e));
-            }
-        }
-    } else {
-        None
-    };
-
-    if !skip_size_check {
-        let partition_size = pit_entry.partition_size();
-        let check_size = if let Some(fh) = &lz4_frame_header {
-            fh.content_size
-        } else {
-            source_size
-        };
-
-        if partition_size > 0 && check_size > partition_size {
-            return Err(FlashError::PartitionTooSmall(
-                pit_entry.partition_name.to_string_lossy().into_owned(),
-            ));
-        }
-    }
-
-    if let Some(header) = lz4_frame_header {
-        Ok(FirmwareInfo::Lz4(FirmwareLz4File {
-            pit_entry,
-            file,
-            size: source_size,
-            header,
-        }))
-    } else {
-        Ok(FirmwareInfo::Normal(FirmwareFile {
-            pit_entry,
-            file,
-            size: source_size,
-        }))
-    }
-}
-
 /// Specifies the device reboot behavior after a flash session concludes.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum RebootMode {
@@ -187,16 +114,15 @@ pub enum RebootMode {
 
 /// Orchestrates the flashing pipeline, processing package and partition sources
 /// and executing the Loke flash protocol.
-pub struct FlashManager<'a> {
+pub struct FlashManager<'a, P = Cursor<&'static [u8]>, I = Cursor<&'static [u8]>> {
     session: &'a mut OdinSession,
     pit_file_bytes: Option<Vec<u8>>,
 
     reboot_mode: RebootMode,
     skip_size_check: bool,
     skip_md5: bool,
-    pit_path: Option<&'a str>,
-    packages: Vec<String>,
-    partitions: Vec<(Option<String>, String)>,
+    packages: Vec<(String, P)>,
+    partitions: Vec<(Option<String>, String, I)>,
     super_used_size: Option<u32>,
     has_download_list: bool,
     sales_code: Option<&'a str>,
@@ -214,7 +140,6 @@ impl<'a> FlashManager<'a> {
             reboot_mode: RebootMode::None,
             skip_size_check: false,
             skip_md5: false,
-            pit_path: None,
             packages: Vec::new(),
             partitions: Vec::new(),
             super_used_size: None,
@@ -225,7 +150,9 @@ impl<'a> FlashManager<'a> {
             vbmeta_flags: 0,
         }
     }
+}
 
+impl<'a, P, I> FlashManager<'a, P, I> {
     /// Sets whether to perform a low-level NAND hardware erase on the `USERDATA` partition
     /// prior to flashing or as a standalone wipe operation.
     pub fn erase(mut self, enabled: bool) -> Self {
@@ -275,22 +202,60 @@ impl<'a> FlashManager<'a> {
         self
     }
 
-    /// Sets an explicit PIT file path.
-    pub fn pit(mut self, pit_path: &'a str) -> Self {
-        self.pit_path = Some(pit_path);
+    /// Sets an explicit PIT payload.
+    pub fn pit(mut self, pit_bytes: impl Into<Vec<u8>>) -> Self {
+        self.pit_file_bytes = Some(pit_bytes.into());
         self
     }
 
-    /// Sets the list of TAR packages to flash.
-    pub fn packages(mut self, packages: &[impl AsRef<str>]) -> Self {
-        self.packages = packages.iter().map(|p| p.as_ref().to_string()).collect();
-        self
+    /// Sets the list of TAR packages `(name, reader)` to flash.
+    pub fn packages<S: Into<String>, R>(
+        self,
+        packages: impl IntoIterator<Item = (S, R)>,
+    ) -> FlashManager<'a, R, I> {
+        FlashManager {
+            session: self.session,
+            pit_file_bytes: self.pit_file_bytes,
+            reboot_mode: self.reboot_mode,
+            skip_size_check: self.skip_size_check,
+            skip_md5: self.skip_md5,
+            packages: packages
+                .into_iter()
+                .map(|(name, reader)| (name.into(), reader))
+                .collect(),
+            partitions: self.partitions,
+            super_used_size: self.super_used_size,
+            has_download_list: self.has_download_list,
+            sales_code: self.sales_code,
+            erase: self.erase,
+            skip: self.skip,
+            vbmeta_flags: self.vbmeta_flags,
+        }
     }
 
-    /// Sets the list of individual partition files to flash.
-    pub fn partitions(mut self, partitions: &[(Option<String>, String)]) -> Self {
-        self.partitions = partitions.to_vec();
-        self
+    /// Sets the list of individual partition inputs `(target_partition, filename, reader)` to flash.
+    pub fn partitions<S: Into<String>, R>(
+        self,
+        partitions: impl IntoIterator<Item = (Option<String>, S, R)>,
+    ) -> FlashManager<'a, P, R> {
+        FlashManager {
+            session: self.session,
+            pit_file_bytes: self.pit_file_bytes,
+            reboot_mode: self.reboot_mode,
+            skip_size_check: self.skip_size_check,
+            skip_md5: self.skip_md5,
+            packages: self.packages,
+            partitions: partitions
+                .into_iter()
+                .map(|(part, name, reader)| (part, name.into(), reader))
+                .collect(),
+            super_used_size: self.super_used_size,
+            has_download_list: self.has_download_list,
+            sales_code: self.sales_code,
+            erase: self.erase,
+            skip: self.skip,
+            vbmeta_flags: self.vbmeta_flags,
+        }
     }
 
     /// Sets the partitions to exclude from flashing. Each target is either a file name
@@ -329,7 +294,11 @@ impl<'a> FlashManager<'a> {
             self.vbmeta_flags &= !flag;
         }
     }
+}
 
+impl<'a, P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin>
+    FlashManager<'a, P, I>
+{
     /// Executes the flashing pipeline sequence.
     pub async fn execute(&mut self) -> Result<(), FlashError> {
         // Step 0: Set device sales code if configured
@@ -339,7 +308,7 @@ impl<'a> FlashManager<'a> {
         }
 
         // If no packages, partitions, or explicit PIT are specified, complete session and return
-        if self.packages.is_empty() && self.partitions.is_empty() && self.pit_path.is_none() {
+        if self.packages.is_empty() && self.partitions.is_empty() && self.pit_file_bytes.is_none() {
             if self.erase {
                 self.session.nand_erase().await?;
             }
@@ -351,24 +320,14 @@ impl<'a> FlashManager<'a> {
             return Ok(());
         }
 
-        // Step 1: Resolve explicit PIT file if provided
-        if let Some(pit_path) = self.pit_path {
-            let mut f = File::open(pit_path)
-                .map_err(|e| FlashError::FileOpenFailed(pit_path.to_string(), e))?;
-            let mut buffer = Vec::new();
-            f.read_to_end(&mut buffer)
-                .map_err(|e| FlashError::FileReadFailed(pit_path.to_string(), e))?;
-            self.pit_file_bytes = Some(buffer);
-        }
+        // Step 1: Verify MD5 footers and scan TAR containers to index entries
+        self.verify_packages().await?;
+        let resolved_entries = self.scan_tar_packages().await?;
 
-        // Step 2: Open packages and scan TAR containers to index entries
-        let opened_packages = self.open_and_verify_packages().await?;
-        let resolved_entries = self.scan_tar_packages(&opened_packages).await?;
-
-        // Step 3: Flash PIT if available and download active PIT data from the device
+        // Step 2: Flash PIT if available and download active PIT data from the device
         let pit_data = self.download_and_parse_pit().await?;
 
-        // Step 4: Resolve the partitions excluded from flashing
+        // Step 3: Resolve the partitions excluded from flashing
         let skipped_ids = self.resolve_skipped_partitions(&pit_data)?;
 
         // The super size check is meaningless when super is not flashed
@@ -380,87 +339,70 @@ impl<'a> FlashManager<'a> {
             self.super_used_size = None;
         }
 
-        // Step 5: Map entries and individual files to FirmwareInfo payloads
-        let mut partition_infos = self
-            .build_partition_infos(
-                &pit_data,
-                resolved_entries,
-                &self.partitions,
-                &skipped_ids,
-                self.skip_size_check,
-            )
+        // Step 4: Map entries and individual files to FirmwarePartitionPayload items
+        let mut planned_partitions = self
+            .build_partition_infos(&pit_data, resolved_entries, &skipped_ids)
             .await?;
 
-        // Step 6: Rewrite vbmeta flags if requested
-        self.rewrite_vbmeta_payloads(&pit_data, &mut partition_infos)
+        // Step 5: Rewrite vbmeta flags if requested
+        self.rewrite_vbmeta_payloads(&pit_data, &mut planned_partitions)
             .await?;
 
         // Auto-detect super_used_size if not specified in TAR metadata
         if self.super_used_size.is_none()
-            && let Some(super_info) = partition_infos.iter_mut().find(|info| {
-                let entry = match info {
-                    FirmwareInfo::Normal(f) => f.pit_entry,
-                    FirmwareInfo::Lz4(f) => f.pit_entry,
-                };
-                is_super_entry(entry)
-            })
+            && let Some(super_part) = planned_partitions
+                .iter()
+                .find(|p| is_super_entry(p.pit_entry))
+            && let Ok(mut reader) = super_part
+                .source
+                .open_reader(&mut self.packages, &mut self.partitions)
+                .await
         {
-            self.super_used_size = inspect_super_firmware_info(super_info).await;
+            self.super_used_size = inspect_super_partition(super_part, &mut reader).await;
         }
 
-        // Step 7: Flash payloads to the device
-        self.flash_partitions(partition_infos, self.reboot_mode)
+        // Step 6: Flash payloads to the device
+        self.flash_partitions(planned_partitions, self.reboot_mode)
             .await?;
 
         Ok(())
     }
 
-    // Helper 1: Open TAR packages and optionally verify MD5 footers
-    async fn open_and_verify_packages(&self) -> Result<Vec<(String, File)>, FlashError> {
+    // Helper 1: Optionally verify MD5 footers on TAR packages
+    async fn verify_packages(&mut self) -> Result<(), FlashError> {
+        if self.skip_md5 {
+            return Ok(());
+        }
+
+        for (name, reader) in &mut self.packages {
+            if name.to_lowercase().ends_with(".md5") {
+                verify_md5_footer(&mut *reader, name)
+                    .await
+                    .map_err(|e| FlashError::Md5VerificationFailed(name.clone(), e))?;
+            }
+        }
+
+        Ok(())
+    }
+
+    // Helper 2: Scan TAR packages to find resolved entries and pull package PIT if needed
+    async fn scan_tar_packages(&mut self) -> Result<Vec<IndexedEntry>, FlashError> {
         if self.packages.is_empty() {
             return Ok(Vec::new());
         }
 
-        let mut opened_packages = Vec::new();
-        for pkg in &self.packages {
-            let file = File::open(pkg).map_err(|e| FlashError::FileOpenFailed(pkg.clone(), e))?;
-            opened_packages.push((pkg.clone(), file));
-        }
-
-        if !self.skip_md5 {
-            for (pkg, file) in &opened_packages {
-                if pkg.to_lowercase().ends_with(".md5") {
-                    verify_md5_footer(AllowStdIo::new(file), pkg)
-                        .await
-                        .map_err(|e| FlashError::Md5VerificationFailed(pkg.clone(), e))?;
-                }
-            }
-        }
-
-        Ok(opened_packages)
-    }
-
-    // Helper 2: Scan TAR packages to find resolved entries and pull package PIT if needed
-    async fn scan_tar_packages<'p>(
-        &mut self,
-        opened_packages: &'p [(String, File)],
-    ) -> Result<Vec<IndexedEntry<'p>>, FlashError> {
-        if opened_packages.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Scan and index TAR containers
         let mut archives_download_lists: Vec<HashSet<String>> = Vec::new();
-        let mut all_packages_entries: Vec<Vec<IndexedEntry<'p>>> = Vec::new();
+        let mut all_packages_entries: Vec<Vec<IndexedEntry>> = Vec::new();
+        let mut pit_from_tar: Option<Vec<u8>> = None;
 
-        for (pkg, file) in opened_packages {
-            let mut archive = TarArchive::new(AllowStdIo::new(file));
+        for (package_index, (pkg_name, reader)) in self.packages.iter_mut().enumerate() {
+            let mut archive = TarArchive::new(&mut *reader);
             let mut package_entries = Vec::new();
 
             while let Some(mut entry) = archive
                 .next_entry()
                 .await
-                .map_err(|e| FlashError::ArchiveCorrupted(pkg.clone(), e))?
+                .map_err(|e| FlashError::ArchiveCorrupted(pkg_name.clone(), e))?
             {
                 let entry_path = entry.path().to_string();
                 let offset = entry.raw_file_position();
@@ -469,12 +411,11 @@ impl<'a> FlashManager<'a> {
                 let (normalized_name, is_lz4) = normalize_basename(&entry_path);
 
                 if normalized_name == "download-list.txt" {
-                    // Read the allowlist manifest
                     let mut content = String::new();
                     entry
                         .read_to_string(&mut content)
                         .await
-                        .map_err(|e| FlashError::ArchiveCorrupted(pkg.clone(), e))?;
+                        .map_err(|e| FlashError::ArchiveCorrupted(pkg_name.clone(), e))?;
 
                     self.has_download_list = true;
                     let download_list = content
@@ -494,19 +435,28 @@ impl<'a> FlashManager<'a> {
                     entry
                         .read_to_string(&mut content)
                         .await
-                        .map_err(|e| FlashError::ArchiveCorrupted(pkg.clone(), e))?;
+                        .map_err(|e| FlashError::ArchiveCorrupted(pkg_name.clone(), e))?;
                     let val = content.trim().parse::<u32>().map_err(|e| {
                         FlashError::ArchiveCorrupted(
-                            pkg.clone(),
-                            std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+                            pkg_name.clone(),
+                            io::Error::new(io::ErrorKind::InvalidData, e),
                         )
                     })?;
                     self.super_used_size = Some(val);
+                } else if normalized_name.ends_with(".pit") {
+                    if self.pit_file_bytes.is_none() {
+                        let mut bytes = Vec::new();
+                        entry
+                            .read_to_end(&mut bytes)
+                            .await
+                            .map_err(|e| FlashError::ArchiveCorrupted(pkg_name.clone(), e))?;
+                        pit_from_tar = Some(bytes);
+                    }
                 } else {
                     package_entries.push(IndexedEntry {
                         original_name: entry_path,
                         normalized_name,
-                        file,
+                        package_index,
                         offset,
                         size,
                         is_lz4,
@@ -520,7 +470,6 @@ impl<'a> FlashManager<'a> {
         // If any package contained a manifest, we use it as our global download allowlist
         let download_allowlist = if let Some((first, rest)) = archives_download_lists.split_first()
         {
-            // Cross-archive manifest consistency check
             if !rest.iter().all(|m| m == first) {
                 return Err(FlashError::CrossArchiveInconsistency);
             }
@@ -529,15 +478,12 @@ impl<'a> FlashManager<'a> {
             None
         };
 
-        let mut resolved_entries: Vec<IndexedEntry<'p>> = Vec::new();
-        let mut pit_entry: Option<IndexedEntry<'p>> = None;
+        let mut resolved_entries: Vec<IndexedEntry> = Vec::new();
 
         // Apply manifest filtering and positional precedence (last-writer-wins)
         for package_entries in all_packages_entries {
             for entry in package_entries {
-                if entry.normalized_name.ends_with(".pit") {
-                    pit_entry = Some(entry);
-                } else if let Some(allowlist) = download_allowlist {
+                if let Some(allowlist) = download_allowlist {
                     if allowlist.contains(&entry.normalized_name) {
                         resolved_entries.push(entry);
                     } else {
@@ -552,12 +498,8 @@ impl<'a> FlashManager<'a> {
             }
         }
 
-        // Extract PIT local bytes if any from TAR archives and set internal field if still None
-        if self.pit_file_bytes.is_none()
-            && let Some(entry) = pit_entry
-        {
-            let mmap = entry.map()?;
-            self.pit_file_bytes = Some(mmap.to_vec());
+        if self.pit_file_bytes.is_none() {
+            self.pit_file_bytes = pit_from_tar;
         }
 
         Ok(resolved_entries)
@@ -600,26 +542,24 @@ impl<'a> FlashManager<'a> {
         Ok(skipped_ids)
     }
 
-    // Helper 5: Map package entries and individual files into FirmwareInfo
+    // Helper 5: Resolve package entries and standalone files into FirmwarePartitionPayload items
     async fn build_partition_infos<'c>(
-        &self,
+        &mut self,
         pit_data: &'c PitData,
-        resolved_entries: Vec<IndexedEntry<'_>>,
-        partitions: &[(Option<String>, String)],
+        resolved_entries: Vec<IndexedEntry>,
         skipped_ids: &HashSet<u32>,
-        skip_size_check: bool,
-    ) -> Result<Vec<FirmwareInfo<'c, Cursor<Mmap>>>, FlashError> {
-        enum PartitionSource<'p> {
-            Archive(IndexedEntry<'p>),
-            File { path: String, is_lz4: bool },
+    ) -> Result<Vec<FirmwarePartitionPayload<'c>>, FlashError> {
+        enum CandidateSource {
+            Archive(IndexedEntry),
+            Standalone { index: usize, is_lz4: bool },
         }
 
-        struct PlannedPartition<'p, 'pit> {
+        struct Candidate<'pit> {
             pit_entry: &'pit PitEntry,
-            source: PartitionSource<'p>,
+            source: CandidateSource,
         }
 
-        let mut planned_partitions = Vec::new();
+        let mut candidates = Vec::new();
 
         // 1. Collect candidate entries from TAR packages
         for entry in resolved_entries {
@@ -632,14 +572,14 @@ impl<'a> FlashManager<'a> {
                 continue;
             };
 
-            planned_partitions.push(PlannedPartition {
+            candidates.push(Candidate {
                 pit_entry,
-                source: PartitionSource::Archive(entry),
+                source: CandidateSource::Archive(entry),
             });
         }
 
         // 2. Collect candidate individual files
-        for (part_name, part_filename) in partitions {
+        for (index, (part_name, part_filename, _)) in self.partitions.iter().enumerate() {
             let (filename, is_lz4_suffix) = normalize_basename(part_filename);
             let entry = match part_name {
                 None => {
@@ -663,10 +603,10 @@ impl<'a> FlashManager<'a> {
                 }
             };
 
-            planned_partitions.push(PlannedPartition {
+            candidates.push(Candidate {
                 pit_entry: entry,
-                source: PartitionSource::File {
-                    path: part_filename.clone(),
+                source: CandidateSource::Standalone {
+                    index,
                     is_lz4: is_lz4_suffix,
                 },
             });
@@ -674,20 +614,20 @@ impl<'a> FlashManager<'a> {
 
         // 3. Partition deduplication: last writer wins
         let mut mapped_partition_ids = HashSet::new();
-        let mut unique_planned = Vec::new();
-        for planned in planned_partitions.into_iter().rev() {
-            if mapped_partition_ids.insert(planned.pit_entry.partition_id) {
-                unique_planned.push(planned);
+        let mut unique_candidates = Vec::new();
+        for candidate in candidates.into_iter().rev() {
+            if mapped_partition_ids.insert(candidate.pit_entry.partition_id) {
+                unique_candidates.push(candidate);
             }
         }
-        unique_planned.reverse();
+        unique_candidates.reverse();
 
         // 4. Drop partitions excluded with skip targets
-        unique_planned.retain(|planned| {
-            if skipped_ids.contains(&planned.pit_entry.partition_id) {
+        unique_candidates.retain(|candidate| {
+            if skipped_ids.contains(&candidate.pit_entry.partition_id) {
                 progress::println(&format!(
                     "Skipping {} (excluded with --skip)",
-                    planned.pit_entry.partition_name.to_string_lossy()
+                    candidate.pit_entry.partition_name.to_string_lossy()
                 ));
                 false
             } else {
@@ -695,50 +635,78 @@ impl<'a> FlashManager<'a> {
             }
         });
 
-        // 5. Lazily map and build FirmwareInfo only for unique planned partitions
-        let mut unique_partition_infos = Vec::with_capacity(unique_planned.len());
-        for planned in unique_planned {
-            let (mmap, file_size, is_lz4, display_name) = match planned.source {
-                PartitionSource::Archive(entry) => {
-                    let mmap = entry.map()?;
-                    (mmap, entry.size, entry.is_lz4, entry.original_name)
-                }
-                PartitionSource::File { path, is_lz4 } => {
-                    let (mmap, file_size) = File::open(&path)
-                        .and_then(|f| {
-                            let file_size = f.metadata()?.len();
-                            // SAFETY: The partition file is opened read-only and is assumed not to be
-                            // concurrently modified or truncated during the flashing operation.
-                            let mmap =
-                                unsafe { MmapOptions::new().len(file_size as usize).map(&f)? };
-                            Ok((mmap, file_size))
-                        })
-                        .map_err(|e| FlashError::MmapFailed(path.clone(), e))?;
-                    (mmap, file_size, is_lz4, path)
+        // 5. Inspect headers and validate sizes only for unique planned partitions
+        let mut planned_partitions = Vec::with_capacity(unique_candidates.len());
+        for candidate in unique_candidates {
+            let (source, is_lz4, display_name) = match candidate.source {
+                CandidateSource::Archive(entry) => (
+                    FirmwarePartitionSource::Package {
+                        index: entry.package_index,
+                        offset: entry.offset,
+                        size: entry.size,
+                    },
+                    entry.is_lz4,
+                    entry.original_name,
+                ),
+                CandidateSource::Standalone { index, is_lz4 } => {
+                    let (_, name, reader) = &mut self.partitions[index];
+                    let display_name = name.clone();
+                    let size = reader
+                        .seek(SeekFrom::End(0))
+                        .await
+                        .map_err(|e| FlashError::FileReadFailed(display_name.clone(), e))?;
+                    (
+                        FirmwarePartitionSource::Image { index, size },
+                        is_lz4,
+                        display_name,
+                    )
                 }
             };
 
-            let info = create_firmware_info(
-                Cursor::new(mmap),
-                file_size,
-                is_lz4,
-                planned.pit_entry,
-                skip_size_check,
-                &display_name,
-            )
-            .await?;
-            unique_partition_infos.push(info);
+            let lz4_header = if is_lz4 {
+                let mut reader = source
+                    .open_reader(&mut self.packages, &mut self.partitions)
+                    .await
+                    .map_err(|e| FlashError::Lz4Header(display_name.clone(), e))?;
+                let fh = Lz4FrameHeader::parse(&mut reader)
+                    .await
+                    .map_err(|e| FlashError::Lz4Header(display_name, e))?;
+                Some(fh)
+            } else {
+                None
+            };
+
+            let planned = FirmwarePartitionPayload {
+                pit_entry: candidate.pit_entry,
+                source,
+                lz4_header,
+            };
+
+            if !self.skip_size_check {
+                let partition_size = planned.pit_entry.partition_size();
+                if partition_size > 0 && planned.uncompressed_size() > partition_size {
+                    return Err(FlashError::PartitionTooSmall(
+                        planned
+                            .pit_entry
+                            .partition_name
+                            .to_string_lossy()
+                            .into_owned(),
+                    ));
+                }
+            }
+
+            planned_partitions.push(planned);
         }
 
-        Ok(unique_partition_infos)
+        Ok(planned_partitions)
     }
 
     // Helper 6: Set the requested AVB flags in vbmeta payloads. Like fastboot, the
     // top-level vbmeta is looked up in boot on devices without a vbmeta partition.
     async fn rewrite_vbmeta_payloads(
-        &self,
+        &mut self,
         pit_data: &PitData,
-        partition_infos: &mut [FirmwareInfo<'_, Cursor<Mmap>>],
+        planned_partitions: &mut [FirmwarePartitionPayload<'_>],
     ) -> Result<(), FlashError> {
         if self.vbmeta_flags == 0 {
             return Ok(());
@@ -746,8 +714,8 @@ impl<'a> FlashManager<'a> {
 
         let has_vbmeta_partition = pit_data.entries.iter().any(is_vbmeta_entry);
         let mut rewritten = false;
-        for info in partition_infos.iter_mut() {
-            let pit_entry = info.pit_entry();
+        for planned in planned_partitions.iter_mut() {
+            let pit_entry = planned.pit_entry;
             let in_footer = if is_vbmeta_entry(pit_entry) {
                 false
             } else if !has_vbmeta_partition && is_boot_entry(pit_entry) {
@@ -760,7 +728,15 @@ impl<'a> FlashManager<'a> {
             let rewrite_err = |e| FlashError::VbmetaRewriteFailed(name.to_string(), e);
 
             // The patched image is sent uncompressed, bypassing LZ4 passthrough
-            let mut data = info.read_all().await.map_err(rewrite_err)?;
+            let mut data = {
+                let mut reader = planned
+                    .source
+                    .open_reader(&mut self.packages, &mut self.partitions)
+                    .await
+                    .map_err(rewrite_err)?;
+                planned.read_all(&mut reader).await.map_err(rewrite_err)?
+            };
+
             let Some(offset) = avb::rewrite_vbmeta(&mut data, self.vbmeta_flags, in_footer)
                 .map_err(rewrite_err)?
             else {
@@ -771,13 +747,8 @@ impl<'a> FlashManager<'a> {
                 "Rewriting {} vbmeta struct at offset: {}",
                 name, offset
             ));
-            let size = data.len() as u64;
-            let mmap = anon_mmap(&data).map_err(rewrite_err)?;
-            *info = FirmwareInfo::Normal(FirmwareFile {
-                pit_entry,
-                file: Cursor::new(mmap),
-                size,
-            });
+            planned.lz4_header = None;
+            planned.source = FirmwarePartitionSource::Memory(data);
             rewritten = true;
         }
 
@@ -791,17 +762,14 @@ impl<'a> FlashManager<'a> {
     }
 
     // Helper 7: Flash deduplicated partition payloads to the device
-    async fn flash_partitions<R: AsyncRead + AsyncSeek + Unpin>(
+    async fn flash_partitions(
         &mut self,
-        partition_infos: Vec<FirmwareInfo<'_, R>>,
+        planned_partitions: Vec<FirmwarePartitionPayload<'_>>,
         reboot_mode: RebootMode,
     ) -> Result<(), FlashError> {
-        let total_bytes: u64 = partition_infos
+        let total_bytes: u64 = planned_partitions
             .iter()
-            .map(|part| match part {
-                FirmwareInfo::Normal(f) => f.size,
-                FirmwareInfo::Lz4(f) => f.header.content_size,
-            })
+            .map(FirmwarePartitionPayload::uncompressed_size)
             .sum();
 
         self.session.set_total_bytes(total_bytes).await?;
@@ -822,26 +790,23 @@ impl<'a> FlashManager<'a> {
                 .map_err(FlashError::SuperSizeCheckFailed)?;
         }
 
-        for info in partition_infos {
-            let name = match &info {
-                FirmwareInfo::Normal(f) => f.pit_entry.partition_name.to_string_lossy(),
-                FirmwareInfo::Lz4(f) => f.pit_entry.partition_name.to_string_lossy(),
-            };
-
-            let partition_size = match &info {
-                FirmwareInfo::Normal(f) => f.size,
-                FirmwareInfo::Lz4(f) => f.header.content_size,
-            };
+        for planned in planned_partitions {
+            let name = planned.pit_entry.partition_name.to_string_lossy();
+            let partition_size = planned.uncompressed_size();
 
             progress::on_event(FlashEvent::PartitionStart {
                 name: &name,
                 size: partition_size,
             });
 
-            let res = match info {
-                FirmwareInfo::Normal(mut f) => self.session.send_file(&mut f).await,
-                FirmwareInfo::Lz4(mut f) => self.session.send_lz4_file(&mut f).await,
-            };
+            let res = async {
+                let mut reader = planned
+                    .source
+                    .open_reader(&mut self.packages, &mut self.partitions)
+                    .await?;
+                self.session.send_partition(&planned, &mut reader).await
+            }
+            .await;
 
             if let Err(e) = res {
                 progress::on_event(FlashEvent::PartitionFail(&name));
@@ -873,56 +838,26 @@ mod tests {
     use crate::odin::OdinConnection;
     use crate::usb::MockBackend;
 
+    fn build_tar(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        for &(path, content) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, path, content).unwrap();
+        }
+        builder.finish().unwrap();
+        builder.into_inner().unwrap()
+    }
+
     #[test]
     fn test_scan_tar_packages_metadata_and_manifest() {
-        let temp_dir = std::env::temp_dir().join("samloader_test_tar");
-        let _ = std::fs::create_dir_all(&temp_dir);
-        let tar_path = temp_dir.join("test_package.tar");
-
-        {
-            let tar_file = File::create(&tar_path).unwrap();
-            let mut builder = tar::Builder::new(tar_file);
-
-            // 1. Add meta-data/super_used_size.txt
-            let mut header = tar::Header::new_gnu();
-            let size_content = b"27276104\n";
-            header.set_size(size_content.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            builder
-                .append_data(
-                    &mut header,
-                    "meta-data/super_used_size.txt",
-                    &size_content[..],
-                )
-                .unwrap();
-
-            // 2. Add meta-data/download-list.txt
-            let mut header = tar::Header::new_gnu();
-            let list_content = b"boot.img\n";
-            header.set_size(list_content.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            builder
-                .append_data(
-                    &mut header,
-                    "meta-data/download-list.txt",
-                    &list_content[..],
-                )
-                .unwrap();
-
-            // 3. Add boot.img
-            let mut header = tar::Header::new_gnu();
-            let boot_content = b"DUMMY BOOT IMAGE DATA";
-            header.set_size(boot_content.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            builder
-                .append_data(&mut header, "boot.img", &boot_content[..])
-                .unwrap();
-
-            builder.finish().unwrap();
-        }
+        let tar_bytes = build_tar(&[
+            ("meta-data/super_used_size.txt", b"27276104\n"),
+            ("meta-data/download-list.txt", b"boot.img\n"),
+            ("boot.img", b"DUMMY BOOT IMAGE DATA"),
+        ]);
 
         futures::executor::block_on(async {
             let backend = Box::new(MockBackend::new());
@@ -930,20 +865,15 @@ mod tests {
             connection.init().await.unwrap();
             let mut session = connection.begin_session().await.unwrap();
 
-            let tar_file = File::open(&tar_path).unwrap();
-            let opened_packages = vec![(tar_path.to_string_lossy().to_string(), tar_file)];
-
-            let mut manager = FlashManager::new(&mut session);
-            let resolved = manager.scan_tar_packages(&opened_packages).await.unwrap();
+            let mut manager = FlashManager::new(&mut session)
+                .packages([("test_package.tar", Cursor::new(tar_bytes.as_slice()))]);
+            let resolved = manager.scan_tar_packages().await.unwrap();
 
             assert_eq!(manager.super_used_size, Some(27276104));
             assert!(manager.has_download_list);
             assert_eq!(resolved.len(), 1);
             assert_eq!(resolved[0].normalized_name, "boot.img");
         });
-
-        let _ = std::fs::remove_file(tar_path);
-        let _ = std::fs::remove_dir(temp_dir);
     }
 
     #[test]
@@ -960,10 +890,7 @@ mod tests {
 
             assert!(
                 manager
-                    .flash_partitions(
-                        Vec::<FirmwareInfo<'_, Cursor<&[u8]>>>::new(),
-                        RebootMode::None
-                    )
+                    .flash_partitions(Vec::new(), RebootMode::None)
                     .await
                     .is_ok()
             );
@@ -986,12 +913,7 @@ mod tests {
             manager.super_used_size = Some(27276104);
             manager.has_download_list = true;
 
-            let res = manager
-                .flash_partitions(
-                    Vec::<FirmwareInfo<'_, Cursor<&[u8]>>>::new(),
-                    RebootMode::None,
-                )
-                .await;
+            let res = manager.flash_partitions(Vec::new(), RebootMode::None).await;
             assert!(matches!(res, Err(FlashError::SuperSizeCheckFailed(_))));
         });
     }
@@ -1015,10 +937,7 @@ mod tests {
 
             assert!(
                 manager
-                    .flash_partitions(
-                        Vec::<FirmwareInfo<'_, Cursor<&[u8]>>>::new(),
-                        RebootMode::None
-                    )
+                    .flash_partitions(Vec::new(), RebootMode::None)
                     .await
                     .is_ok()
             );
@@ -1027,30 +946,7 @@ mod tests {
 
     #[test]
     fn test_scan_tar_packages_corrupt_manifest_fails() {
-        let temp_dir = std::env::temp_dir().join("samloader_test_tar_corrupt_manifest");
-        let _ = std::fs::create_dir_all(&temp_dir);
-        let tar_path = temp_dir.join("corrupt_manifest.tar");
-
-        {
-            let tar_file = File::create(&tar_path).unwrap();
-            let mut builder = tar::Builder::new(tar_file);
-
-            // Add meta-data/download-list.txt with invalid UTF-8 bytes
-            let mut header = tar::Header::new_gnu();
-            let corrupt_content = [0xFF, 0xFE, 0xFD];
-            header.set_size(corrupt_content.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            builder
-                .append_data(
-                    &mut header,
-                    "meta-data/download-list.txt",
-                    &corrupt_content[..],
-                )
-                .unwrap();
-
-            builder.finish().unwrap();
-        }
+        let tar_bytes = build_tar(&[("meta-data/download-list.txt", &[0xFF, 0xFE, 0xFD])]);
 
         futures::executor::block_on(async {
             let backend = Box::new(MockBackend::new());
@@ -1058,17 +954,12 @@ mod tests {
             connection.init().await.unwrap();
             let mut session = connection.begin_session().await.unwrap();
 
-            let tar_file = File::open(&tar_path).unwrap();
-            let opened_packages = vec![(tar_path.to_string_lossy().to_string(), tar_file)];
-
-            let mut manager = FlashManager::new(&mut session);
-            let result = manager.scan_tar_packages(&opened_packages).await;
+            let mut manager = FlashManager::new(&mut session)
+                .packages([("corrupt_manifest.tar", Cursor::new(tar_bytes.as_slice()))]);
+            let result = manager.scan_tar_packages().await;
 
             assert!(matches!(result, Err(FlashError::ArchiveCorrupted(_, _))));
         });
-
-        let _ = std::fs::remove_file(tar_path);
-        let _ = std::fs::remove_dir(temp_dir);
     }
 
     #[test]
@@ -1079,13 +970,11 @@ mod tests {
             connection.init().await.unwrap();
             let mut session = connection.begin_session().await.unwrap();
 
-            let mut manager = FlashManager::new(&mut session);
-            manager.pit_file_bytes = Some(
-                include_bytes!(concat!(
+            let mut manager = FlashManager::new(&mut session).pit(
+                &include_bytes!(concat!(
                     env!("CARGO_MANIFEST_DIR"),
                     "/test-data/M3_EUR_OPEN_4G.pit"
-                ))
-                .to_vec(),
+                ))[..],
             );
 
             let pit_data = manager.download_and_parse_pit().await.unwrap();
@@ -1157,18 +1046,16 @@ mod tests {
 
     #[test]
     fn test_build_partition_infos_drops_skipped_partitions() {
-        let temp_dir = std::env::temp_dir().join("samloader_test_skip_build");
-        let _ = std::fs::create_dir_all(&temp_dir);
-        let mut partitions = Vec::new();
-        for name in ["boot.img", "vbmeta.img", "dtbo.img"] {
-            let path = temp_dir.join(name);
-            std::fs::write(&path, b"DUMMY IMAGE DATA").unwrap();
-            partitions.push((None, path.to_string_lossy().into_owned()));
-        }
-        partitions.push((
-            Some("VBMETA_B".to_string()),
-            temp_dir.join("vbmeta.img").to_string_lossy().into_owned(),
-        ));
+        let partitions = vec![
+            (None, "boot.img", Cursor::new(&b"DUMMY IMAGE DATA"[..])),
+            (None, "vbmeta.img", Cursor::new(&b"DUMMY IMAGE DATA"[..])),
+            (None, "dtbo.img", Cursor::new(&b"DUMMY IMAGE DATA"[..])),
+            (
+                Some("VBMETA_B".to_string()),
+                "vbmeta.img",
+                Cursor::new(&b"DUMMY IMAGE DATA"[..]),
+            ),
+        ];
 
         futures::executor::block_on(async {
             let pit_data = ab_pit_data();
@@ -1177,51 +1064,31 @@ mod tests {
             connection.init().await.unwrap();
             let mut session = connection.begin_session().await.unwrap();
 
-            let manager = FlashManager::new(&mut session).skip(&["boot.img", "VBMETA"]);
+            let mut manager = FlashManager::new(&mut session)
+                .partitions(partitions)
+                .skip(&["boot.img", "VBMETA"]);
             let skipped_ids = manager.resolve_skipped_partitions(&pit_data).unwrap();
             let infos = manager
-                .build_partition_infos(&pit_data, Vec::new(), &partitions, &skipped_ids, false)
+                .build_partition_infos(&pit_data, Vec::new(), &skipped_ids)
                 .await
                 .unwrap();
 
             let names: Vec<String> = infos
                 .iter()
-                .map(|info| match info {
-                    FirmwareInfo::Normal(f) => f.pit_entry.partition_name.to_string_lossy(),
-                    FirmwareInfo::Lz4(f) => f.pit_entry.partition_name.to_string_lossy(),
-                })
-                .map(|n| n.into_owned())
+                .map(|p| p.pit_entry.partition_name.to_string_lossy().into_owned())
                 .collect();
             assert_eq!(names, ["DTBO_A"]);
         });
-
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn test_execute_skipping_super_skips_super_size_check() {
-        let temp_dir = std::env::temp_dir().join("samloader_test_skip_super");
-        let _ = std::fs::create_dir_all(&temp_dir);
-        let tar_path = temp_dir.join("AP.tar");
-
-        {
-            let tar_file = File::create(&tar_path).unwrap();
-            let mut builder = tar::Builder::new(tar_file);
-            let files: [(&str, &[u8]); 4] = [
-                ("meta-data/super_used_size.txt", b"27276104\n"),
-                ("meta-data/download-list.txt", b"boot.img\nsuper.img\n"),
-                ("boot.img", b"DUMMY BOOT IMAGE DATA"),
-                ("super.img", b"DUMMY SUPER IMAGE DATA"),
-            ];
-            for (path, content) in files {
-                let mut header = tar::Header::new_gnu();
-                header.set_size(content.len() as u64);
-                header.set_mode(0o644);
-                header.set_cksum();
-                builder.append_data(&mut header, path, content).unwrap();
-            }
-            builder.finish().unwrap();
-        }
+        let tar_bytes = build_tar(&[
+            ("meta-data/super_used_size.txt", b"27276104\n"),
+            ("meta-data/download-list.txt", b"boot.img\nsuper.img\n"),
+            ("boot.img", b"DUMMY BOOT IMAGE DATA"),
+            ("super.img", b"DUMMY SUPER IMAGE DATA"),
+        ]);
 
         let run = |skip: &[&str]| {
             futures::executor::block_on(async {
@@ -1234,7 +1101,7 @@ mod tests {
                 connection.init().await.unwrap();
                 let mut session = connection.begin_session().await.unwrap();
                 FlashManager::new(&mut session)
-                    .packages(&[tar_path.to_string_lossy()])
+                    .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
                     .skip(skip)
                     .execute()
                     .await
@@ -1243,14 +1110,9 @@ mod tests {
 
         assert!(matches!(run(&[]), Err(FlashError::SuperSizeCheckFailed(_))));
         assert!(run(&["super.img"]).is_ok());
-
-        let _ = std::fs::remove_dir_all(temp_dir);
-    }
-    fn anon_mapping(data: &[u8]) -> Cursor<Mmap> {
-        Cursor::new(anon_mmap(data).unwrap())
     }
 
-    fn lz4_mapping(data: &[u8]) -> (Cursor<Mmap>, u64, Lz4FrameHeader) {
+    fn lz4_compress(data: &[u8]) -> (Vec<u8>, Lz4FrameHeader) {
         use lz4_flex::frame::{BlockMode, BlockSize, FrameEncoder, FrameInfo};
         use std::io::Write;
 
@@ -1261,11 +1123,10 @@ mod tests {
         let mut encoder = FrameEncoder::with_frame_info(info, Vec::new());
         encoder.write_all(data).unwrap();
         let compressed = encoder.finish().unwrap();
-        let size = compressed.len() as u64;
         let header =
             futures::executor::block_on(Lz4FrameHeader::parse(Cursor::new(&compressed[..])))
                 .unwrap();
-        (anon_mapping(&compressed), size, header)
+        (compressed, header)
     }
 
     fn find_entry<'p>(pit_data: &'p PitData, name: &str) -> &'p PitEntry {
@@ -1274,7 +1135,8 @@ mod tests {
 
     fn rewrite_vbmeta(
         pit_data: &PitData,
-        infos: &mut [FirmwareInfo<'_, Cursor<Mmap>>],
+        partitions: Vec<Cursor<Vec<u8>>>,
+        planned: &mut [FirmwarePartitionPayload<'_>],
         verity: bool,
         verification: bool,
     ) -> Result<(), FlashError> {
@@ -1285,17 +1147,23 @@ mod tests {
             let mut session = connection.begin_session().await.unwrap();
 
             FlashManager::new(&mut session)
+                .partitions(partitions.into_iter().map(|r| (None, "part", r)))
                 .disable_verity(verity)
                 .disable_verification(verification)
-                .rewrite_vbmeta_payloads(pit_data, infos)
+                .rewrite_vbmeta_payloads(pit_data, planned)
                 .await
         })
     }
 
-    fn normal_bytes(info: &FirmwareInfo<'_, Cursor<Mmap>>) -> Vec<u8> {
-        match info {
-            FirmwareInfo::Normal(f) => f.file.get_ref().to_vec(),
-            FirmwareInfo::Lz4(_) => panic!("expected an uncompressed payload"),
+    fn planned_bytes(
+        planned: &FirmwarePartitionPayload<'_>,
+        partitions: &[Cursor<Vec<u8>>],
+    ) -> Vec<u8> {
+        assert!(planned.lz4_header.is_none());
+        match &planned.source {
+            FirmwarePartitionSource::Memory(data) => data.clone(),
+            FirmwarePartitionSource::Image { index, .. } => partitions[*index].get_ref().clone(),
+            FirmwarePartitionSource::Package { .. } => unreachable!(),
         }
     }
 
@@ -1306,74 +1174,107 @@ mod tests {
         let pit_data = ab_pit_data();
         let image = vbmeta_image(0);
         let size = image.len() as u64;
-        let (lz4, lz4_size, header) = lz4_mapping(&image);
-        let mut infos = vec![
-            FirmwareInfo::Normal(FirmwareFile {
+        let (lz4_bytes, header) = lz4_compress(&image);
+        let lz4_size = lz4_bytes.len() as u64;
+        let backing = || {
+            vec![
+                Cursor::new(image.clone()),
+                Cursor::new(lz4_bytes.clone()),
+                Cursor::new(image.clone()),
+                Cursor::new(image.clone()),
+            ]
+        };
+        let mut planned = vec![
+            FirmwarePartitionPayload {
                 pit_entry: find_entry(&pit_data, "VBMETA_A"),
-                file: anon_mapping(&image),
-                size,
-            }),
-            FirmwareInfo::Lz4(FirmwareLz4File {
+                source: FirmwarePartitionSource::Image { index: 0, size },
+                lz4_header: None,
+            },
+            FirmwarePartitionPayload {
                 pit_entry: find_entry(&pit_data, "VBMETA_B"),
-                file: lz4,
-                size: lz4_size,
-                header,
-            }),
-            FirmwareInfo::Normal(FirmwareFile {
+                source: FirmwarePartitionSource::Image {
+                    index: 1,
+                    size: lz4_size,
+                },
+                lz4_header: Some(header),
+            },
+            FirmwarePartitionPayload {
                 pit_entry: find_entry(&pit_data, "VBMETA_SYSTEM_A"),
-                file: anon_mapping(&image),
-                size,
-            }),
-            FirmwareInfo::Normal(FirmwareFile {
+                source: FirmwarePartitionSource::Image { index: 2, size },
+                lz4_header: None,
+            },
+            FirmwarePartitionPayload {
                 pit_entry: find_entry(&pit_data, "BOOT_A"),
-                file: anon_mapping(&image),
-                size,
-            }),
+                source: FirmwarePartitionSource::Image { index: 3, size },
+                lz4_header: None,
+            },
         ];
 
-        rewrite_vbmeta(&pit_data, &mut infos, true, false).unwrap();
-        assert_eq!(vbmeta_flags(&normal_bytes(&infos[0]), 0), 0x1);
-        assert_eq!(vbmeta_flags(&normal_bytes(&infos[1]), 0), 0x1);
+        rewrite_vbmeta(&pit_data, backing(), &mut planned, true, false).unwrap();
+        assert_eq!(
+            vbmeta_flags(&planned_bytes(&planned[0], &backing()), 0),
+            0x1
+        );
+        assert_eq!(
+            vbmeta_flags(&planned_bytes(&planned[1], &backing()), 0),
+            0x1
+        );
 
         // Rewriting again accumulates flags, and LZ4 passthrough stays disabled
-        rewrite_vbmeta(&pit_data, &mut infos, false, true).unwrap();
-        for info in &infos[..2] {
-            let data = normal_bytes(info);
+        rewrite_vbmeta(&pit_data, backing(), &mut planned, false, true).unwrap();
+        for p in &planned[..2] {
+            let data = planned_bytes(p, &backing());
             assert_eq!(data.len(), image.len());
             assert_eq!(vbmeta_flags(&data, 0), 0x3);
         }
 
         // Like fastboot, only top-level vbmeta partitions are rewritten
-        assert_eq!(normal_bytes(&infos[2]), image);
-        assert_eq!(normal_bytes(&infos[3]), image);
+        assert_eq!(planned_bytes(&planned[2], &backing()), image);
+        assert_eq!(planned_bytes(&planned[3], &backing()), image);
     }
 
     #[test]
     fn test_rewrite_vbmeta_payloads_disabled_keeps_payloads() {
         let pit_data = ab_pit_data();
-        let (lz4, size, header) = lz4_mapping(&crate::avb::tests::vbmeta_image(0));
-        let mut infos = vec![FirmwareInfo::Lz4(FirmwareLz4File {
+        let (lz4_bytes, header) = lz4_compress(&crate::avb::tests::vbmeta_image(0));
+        let size = lz4_bytes.len() as u64;
+        let mut planned = vec![FirmwarePartitionPayload {
             pit_entry: find_entry(&pit_data, "VBMETA_A"),
-            file: lz4,
-            size,
-            header,
-        })];
+            source: FirmwarePartitionSource::Image { index: 0, size },
+            lz4_header: Some(header),
+        }];
 
-        rewrite_vbmeta(&pit_data, &mut infos, false, false).unwrap();
-        assert!(matches!(infos[0], FirmwareInfo::Lz4(_)));
+        rewrite_vbmeta(
+            &pit_data,
+            vec![Cursor::new(lz4_bytes)],
+            &mut planned,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(planned[0].lz4_header.is_some());
     }
 
     #[test]
     fn test_rewrite_vbmeta_payloads_invalid_vbmeta_fails() {
         let pit_data = ab_pit_data();
-        let mut infos = vec![FirmwareInfo::Normal(FirmwareFile {
+        let mut planned = vec![FirmwarePartitionPayload {
             pit_entry: find_entry(&pit_data, "VBMETA_A"),
-            file: anon_mapping(&[0u8; 4096]),
-            size: 4096,
-        })];
+            source: FirmwarePartitionSource::Image {
+                index: 0,
+                size: 4096,
+            },
+            lz4_header: None,
+        }];
 
         assert!(matches!(
-            rewrite_vbmeta(&pit_data, &mut infos, true, true),
+            rewrite_vbmeta(
+                &pit_data,
+                vec![Cursor::new(vec![0u8; 4096])],
+                &mut planned,
+                true,
+                true,
+            ),
             Err(FlashError::VbmetaRewriteFailed(name, _)) if name == "VBMETA_A"
         ));
     }
@@ -1396,21 +1297,33 @@ mod tests {
         boot[footer..footer + 4].copy_from_slice(b"AVBf");
         boot[footer + 20..footer + 28].copy_from_slice(&0x1000u64.to_be_bytes());
 
-        let mut infos = vec![FirmwareInfo::Normal(FirmwareFile {
+        let mut planned = vec![FirmwarePartitionPayload {
             pit_entry: find_entry(&pit_data, "BOOT"),
-            file: anon_mapping(&boot),
-            size: boot.len() as u64,
-        })];
-        rewrite_vbmeta(&pit_data, &mut infos, true, true).unwrap();
-        assert_eq!(vbmeta_flags(&normal_bytes(&infos[0]), 0x1000), 0x3);
+            source: FirmwarePartitionSource::Image {
+                index: 0,
+                size: boot.len() as u64,
+            },
+            lz4_header: None,
+        }];
+        rewrite_vbmeta(&pit_data, vec![Cursor::new(boot)], &mut planned, true, true).unwrap();
+        assert_eq!(vbmeta_flags(&planned_bytes(&planned[0], &[]), 0x1000), 0x3);
 
-        let mut infos = vec![FirmwareInfo::Normal(FirmwareFile {
+        let mut planned = vec![FirmwarePartitionPayload {
             pit_entry: find_entry(&pit_data, "BOOT"),
-            file: anon_mapping(&[0u8; 4096]),
-            size: 4096,
-        })];
+            source: FirmwarePartitionSource::Image {
+                index: 0,
+                size: 4096,
+            },
+            lz4_header: None,
+        }];
         assert!(matches!(
-            rewrite_vbmeta(&pit_data, &mut infos, true, false),
+            rewrite_vbmeta(
+                &pit_data,
+                vec![Cursor::new(vec![0u8; 4096])],
+                &mut planned,
+                true,
+                false,
+            ),
             Err(FlashError::VbmetaRewriteFailed(_, _))
         ));
     }
@@ -1419,10 +1332,7 @@ mod tests {
     fn test_execute_disable_verity_with_lz4_vbmeta() {
         use std::io::Write;
 
-        let temp_dir = std::env::temp_dir().join("samloader_test_disable_verity");
-        let _ = std::fs::create_dir_all(&temp_dir);
-
-        let write_package = |name: &str, vbmeta: &[u8]| {
+        let build_package = |vbmeta: &[u8]| {
             let mut encoder = lz4_flex::frame::FrameEncoder::with_frame_info(
                 lz4_flex::frame::FrameInfo::new()
                     .content_size(Some(vbmeta.len() as u64))
@@ -1433,26 +1343,15 @@ mod tests {
             encoder.write_all(vbmeta).unwrap();
             let vbmeta_lz4 = encoder.finish().unwrap();
 
-            let tar_path = temp_dir.join(name);
-            let mut builder = tar::Builder::new(File::create(&tar_path).unwrap());
-            let files: [(&str, &[u8]); 2] = [
+            build_tar(&[
                 ("vbmeta.img.lz4", &vbmeta_lz4),
                 ("boot.img", b"DUMMY BOOT IMAGE DATA"),
-            ];
-            for (path, content) in files {
-                let mut header = tar::Header::new_gnu();
-                header.set_size(content.len() as u64);
-                header.set_mode(0o644);
-                header.set_cksum();
-                builder.append_data(&mut header, path, content).unwrap();
-            }
-            builder.finish().unwrap();
-            tar_path
+            ])
         };
-        let valid = write_package("valid.tar", &crate::avb::tests::vbmeta_image(0));
-        let invalid = write_package("invalid.tar", &[0u8; 4096]);
+        let valid = build_package(&crate::avb::tests::vbmeta_image(0));
+        let invalid = build_package(&[0u8; 4096]);
 
-        let run = |tar_path: &Path, verity: bool| {
+        let run = |name: &str, tar_bytes: &[u8], verity: bool| {
             futures::executor::block_on(async {
                 let backend = Box::new(MockBackend::with_profile(
                     crate::usb::DeviceProfile::sm_f968b(),
@@ -1462,22 +1361,20 @@ mod tests {
                 let mut session = connection.begin_session().await.unwrap();
                 assert!(session.is_lz4_supported());
                 FlashManager::new(&mut session)
-                    .packages(&[tar_path.to_string_lossy()])
+                    .packages([(name, Cursor::new(tar_bytes))])
                     .disable_verity(verity)
                     .execute()
                     .await
             })
         };
 
-        assert!(run(&valid, false).is_ok());
-        assert!(run(&valid, true).is_ok());
+        assert!(run("valid.tar", &valid, false).is_ok());
+        assert!(run("valid.tar", &valid, true).is_ok());
         // The vbmeta in the package is only parsed when a rewrite is requested
-        assert!(run(&invalid, false).is_ok());
+        assert!(run("invalid.tar", &invalid, false).is_ok());
         assert!(matches!(
-            run(&invalid, true),
+            run("invalid.tar", &invalid, true),
             Err(FlashError::VbmetaRewriteFailed(name, _)) if name == "VBMETA_A"
         ));
-
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 }

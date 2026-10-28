@@ -15,9 +15,9 @@
 //! Helper functions for inspecting Android Logical Partition (`liblp`) metadata
 //! and sparse image containers to derive dynamic partition sizing.
 
-use crate::firmware::FirmwareInfo;
+use crate::firmware::FirmwarePartitionPayload;
 use futures::StreamExt;
-use futures::io::{AsyncRead, AsyncSeek};
+use futures::io::AsyncRead;
 
 const SPARSE_HEADER_MAGIC: u32 = 0xed26_ff3a;
 const CHUNK_RAW: u16 = 0xcac1;
@@ -32,26 +32,25 @@ const LP_PRIMARY_HEADER_OFFSET: usize = 0x3000;
 const REQUIRED_LOGICAL_SIZE: usize = 256 * 1024;
 const DECOMPRESS_PREFIX_LIMIT: usize = 512 * 1024;
 
-/// Inspects a [`FirmwareInfo`] representing a `SUPER` partition and attempts to
+/// Inspects a [`FirmwarePartitionPayload`] representing a `SUPER` partition and attempts to
 /// parse the active linear extent sizes to determine the `super_used_size` in sectors.
-pub(crate) async fn inspect_super_firmware_info<R: AsyncRead + AsyncSeek + Unpin>(
-    info: &mut FirmwareInfo<'_, R>,
+pub(crate) async fn inspect_super_partition<R: AsyncRead + Unpin>(
+    part: &FirmwarePartitionPayload<'_>,
+    reader: &mut R,
 ) -> Option<u32> {
-    match info {
-        FirmwareInfo::Normal(f) => {
-            let prefix = std::pin::pin!(f.slices(DECOMPRESS_PREFIX_LIMIT))
+    if part.lz4_header.is_some() {
+        let decompressed =
+            std::pin::pin!(part.decompressed_slices(reader, DECOMPRESS_PREFIX_LIMIT))
                 .next()
                 .await?
                 .ok()?;
-            inspect_super_bytes(&prefix)
-        }
-        FirmwareInfo::Lz4(f) => {
-            let decompressed = std::pin::pin!(f.decompressed_slices(DECOMPRESS_PREFIX_LIMIT))
-                .next()
-                .await?
-                .ok()?;
-            inspect_super_bytes(&decompressed)
-        }
+        inspect_super_bytes(&decompressed)
+    } else {
+        let prefix = std::pin::pin!(part.slices(reader, DECOMPRESS_PREFIX_LIMIT))
+            .next()
+            .await?
+            .ok()?;
+        inspect_super_bytes(&prefix)
     }
 }
 

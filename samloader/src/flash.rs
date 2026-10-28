@@ -19,7 +19,9 @@ use crate::print_error;
 use indicatif::{ProgressBar, ProgressStyle};
 use samloader_odin::{
     FlashEvent, FlashManager, FlashProgress, OdinConnection, RebootMode, UsbBackendOption,
-    create_backend, futures::executor::block_on, set_progress,
+    create_backend,
+    futures::{executor::block_on, io::AllowStdIo},
+    set_progress,
 };
 use std::collections::HashSet;
 use std::fs::File;
@@ -244,6 +246,41 @@ pub(crate) fn action_flash(
         }
     }
 
+    let mut opened_packages = Vec::with_capacity(packages.len());
+    for pkg in packages {
+        let file = match File::open(pkg) {
+            Ok(f) => f,
+            Err(e) => {
+                print_error!("Failed to open file \"{}\": {}", pkg, e);
+                return 1;
+            }
+        };
+        opened_packages.push((pkg.as_str(), AllowStdIo::new(file)));
+    }
+
+    let mut opened_partitions = Vec::with_capacity(partitions.len());
+    for p in partitions {
+        let file = match File::open(&p.filename) {
+            Ok(f) => f,
+            Err(e) => {
+                print_error!("Failed to open file \"{}\": {}", p.filename, e);
+                return 1;
+            }
+        };
+        opened_partitions.push((p.name.clone(), p.filename.as_str(), AllowStdIo::new(file)));
+    }
+
+    let pit_bytes = match pit {
+        Some(pit_path) => match std::fs::read(pit_path) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                print_error!("Failed to read file \"{}\": {}", pit_path, e);
+                return 1;
+            }
+        },
+        None => None,
+    };
+
     set_progress(CliProgress::new(verbose));
 
     block_on(async {
@@ -269,25 +306,20 @@ pub(crate) fn action_flash(
             }
         };
 
-        let mapped_partitions: Vec<(Option<String>, String)> = partitions
-            .iter()
-            .map(|p| (p.name.clone(), p.filename.clone()))
-            .collect();
-
         let mut flash_manager = FlashManager::new(&mut session)
             .reboot_mode(reboot_mode)
             .skip_size_check(skip_size_check)
             .skip_md5(skip_md5)
             .erase(erase)
-            .packages(packages)
-            .partitions(&mapped_partitions)
+            .packages(opened_packages)
+            .partitions(opened_partitions)
             .skip(skip)
             .disable_verity(disable_verity)
             .disable_verification(disable_verification)
             .sales_code(csc_code);
 
-        if let Some(pit_path) = pit {
-            flash_manager = flash_manager.pit(pit_path);
+        if let Some(buffer) = pit_bytes {
+            flash_manager = flash_manager.pit(buffer);
         }
 
         if let Err(e) = flash_manager.execute().await {

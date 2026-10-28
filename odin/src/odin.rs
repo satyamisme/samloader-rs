@@ -15,11 +15,12 @@
 
 use crate::device_info::{DeviceInfo, SessionDeviceInfo};
 use crate::error::{LokeError, OdinError};
+use crate::firmware::FirmwarePartitionPayload;
 use crate::progress;
 use crate::protocol::{CMD_PIT, Command, DataChunk, Response, STREAMING_CHUNK_ACK};
 use crate::usb::UsbTransfer;
 use futures::StreamExt;
-use futures::io::{AsyncRead, AsyncSeek};
+use futures::io::AsyncRead;
 use futures::stream::Stream;
 use samloader_pit::PitEntry;
 use std::time::Duration;
@@ -547,33 +548,29 @@ impl OdinSession {
         Ok(())
     }
 
-    /// Flashes an uncompressed partition firmware file payload to the device.
-    pub(crate) async fn send_file<R: AsyncRead + AsyncSeek + Unpin>(
+    /// Flashes a planned partition payload to the device, streaming LZ4 blocks directly
+    /// when supported by the bootloader or decompressing on the fly when needed.
+    pub(crate) async fn send_partition<R: AsyncRead + Unpin>(
         &mut self,
-        info: &mut crate::firmware::FirmwareFile<'_, R>,
+        part: &FirmwarePartitionPayload<'_>,
+        reader: &mut R,
     ) -> Result<(), OdinError> {
-        let pit_entry = info.pit_entry;
-        progress::set_length(info.size);
-        let slices = info.slices(MAX_SLICE_SIZE);
-        self.transmit_slices(slices, pit_entry).await
-    }
+        let pit_entry = part.pit_entry;
+        let Some(header) = &part.lz4_header else {
+            progress::set_length(part.size());
+            let slices = part.slices(reader, MAX_SLICE_SIZE);
+            return self.transmit_slices(slices, pit_entry).await;
+        };
 
-    /// Flashes an LZ4-compressed partition firmware file payload to the device,
-    /// decompressing on-the-fly if needed.
-    pub(crate) async fn send_lz4_file<R: AsyncRead + AsyncSeek + Unpin>(
-        &mut self,
-        info: &mut crate::firmware::FirmwareLz4File<'_, R>,
-    ) -> Result<(), OdinError> {
-        let pit_entry = info.pit_entry;
-        if !self.lz4_supported || info.header.block_max_size != 1024 * 1024 {
-            progress::set_length(info.header.content_size);
-            let slices = info.decompressed_slices(MAX_SLICE_SIZE);
+        if !self.lz4_supported || header.block_max_size != 1024 * 1024 {
+            progress::set_length(header.content_size);
+            let slices = part.decompressed_slices(reader, MAX_SLICE_SIZE);
             return self.transmit_slices(slices, pit_entry).await;
         }
 
-        progress::set_length(info.size);
+        progress::set_length(part.size());
 
-        let slices = info.slices(MAX_SLICE_SIZE);
+        let slices = part.compressed_slices(reader, MAX_SLICE_SIZE);
 
         let mut slices = std::pin::pin!(slices.peekable());
         while let Some(slice_res) = slices.next().await {
