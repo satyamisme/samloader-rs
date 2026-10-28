@@ -23,6 +23,7 @@ use samloader_odin::{
     futures::{executor::block_on, io::AllowStdIo},
     package_flash_files, set_progress,
 };
+use std::error::Error;
 use std::fs::File;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::Path;
@@ -247,6 +248,16 @@ pub(crate) struct FlashArgs {
 }
 
 pub(crate) fn action_flash(args: FlashArgs) -> i32 {
+    match flash(args) {
+        Ok(()) => 0,
+        Err(e) => {
+            print_error!("{}", e);
+            1
+        }
+    }
+}
+
+fn flash(args: FlashArgs) -> Result<(), Box<dyn Error>> {
     let FlashArgs {
         usb_backend,
         verbose,
@@ -268,99 +279,57 @@ pub(crate) fn action_flash(args: FlashArgs) -> i32 {
     if !force {
         let mut check_packages = Vec::with_capacity(packages.len());
         for pkg in &packages {
-            let file = match File::open(pkg) {
-                Ok(f) => f,
-                Err(e) => {
-                    print_error!("Failed to open file \"{}\": {}", pkg, e);
-                    return 1;
-                }
-            };
+            let file =
+                File::open(pkg).map_err(|e| format!("Failed to open file \"{}\": {}", pkg, e))?;
             check_packages.push((pkg.clone(), AllowStdIo::new(file)));
         }
 
-        let package_files = match block_on(package_flash_files(&mut check_packages)) {
-            Ok(files) => files,
-            Err(e) => {
-                print_error!("{}", e);
-                return 1;
-            }
-        };
+        let package_files = block_on(package_flash_files(&mut check_packages))?;
 
         if flashes_userdata(&package_files, &partitions, &skip) {
             if !io::stdin().is_terminal() {
-                print_error!(
+                return Err(
                     "Flash list contains userdata, which will wipe the device's data. \
-                     Pass --force to flash it without a terminal."
+                            Pass --force to flash it without a terminal."
+                        .into(),
                 );
-                return 1;
             }
             if !confirm("Flash list contains userdata. This will wipe the device's data. Continue?")
             {
-                print_error!("Flashing aborted by user.");
-                return 1;
+                return Err("Flashing aborted by user.".into());
             }
         }
     }
 
     let mut opened_packages = Vec::with_capacity(packages.len());
     for pkg in &packages {
-        let file = match File::open(pkg) {
-            Ok(f) => f,
-            Err(e) => {
-                print_error!("Failed to open file \"{}\": {}", pkg, e);
-                return 1;
-            }
-        };
+        let file =
+            File::open(pkg).map_err(|e| format!("Failed to open file \"{}\": {}", pkg, e))?;
         opened_packages.push((pkg.as_str(), AllowStdIo::new(file)));
     }
 
     let mut opened_partitions = Vec::with_capacity(partitions.len());
     for p in &partitions {
-        let file = match File::open(&p.filename) {
-            Ok(f) => f,
-            Err(e) => {
-                print_error!("Failed to open file \"{}\": {}", p.filename, e);
-                return 1;
-            }
-        };
+        let file = File::open(&p.filename)
+            .map_err(|e| format!("Failed to open file \"{}\": {}", p.filename, e))?;
         opened_partitions.push((p.name.clone(), p.filename.as_str(), AllowStdIo::new(file)));
     }
 
     let pit_bytes = match pit {
-        Some(pit_path) => match std::fs::read(&pit_path) {
-            Ok(b) => Some(b),
-            Err(e) => {
-                print_error!("Failed to read file \"{}\": {}", pit_path, e);
-                return 1;
-            }
-        },
+        Some(pit_path) => Some(
+            std::fs::read(&pit_path)
+                .map_err(|e| format!("Failed to read file \"{}\": {}", pit_path, e))?,
+        ),
         None => None,
     };
 
     set_progress(CliProgress::new(verbose));
 
     block_on(async {
-        let usb = match create_backend(usb_backend, wait).await {
-            Ok(u) => u,
-            Err(e) => {
-                print_error!("{}", e);
-                return 1;
-            }
-        };
+        let usb = create_backend(usb_backend, wait).await?;
         let mut connection = OdinConnection::new(usb);
-
-        if let Err(e) = connection.init().await {
-            print_error!("{}", e);
-            return 1;
-        }
-
-        let mut session = match connection.begin_session().await {
-            Ok(s) => s,
-            Err(e) => {
-                print_error!("{}", e);
-                return 1;
-            }
-        };
+        connection.init().await?;
+        let mut session = connection.begin_session().await?;
 
         let mut flash_manager = FlashManager::new(&mut session)
             .reboot_mode(reboot_mode)
@@ -378,11 +347,7 @@ pub(crate) fn action_flash(args: FlashArgs) -> i32 {
             flash_manager = flash_manager.pit(buffer);
         }
 
-        if let Err(e) = flash_manager.execute().await {
-            print_error!("{}", e);
-            return 1;
-        }
-
-        0
+        flash_manager.execute().await?;
+        Ok(())
     })
 }
