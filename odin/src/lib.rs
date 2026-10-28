@@ -41,7 +41,7 @@ pub use flash::{FlashManager, RebootMode, package_flash_files};
 pub use odin::{OdinConnection, OdinSession, query_device_info, reboot_download};
 pub use progress::{FlashEvent, FlashProgress, clear_progress, set_progress};
 pub use usb::{
-    MaybeSend, UsbBackend, UsbBackendOption, UsbTransfer, create_backend, detect_device,
+    MaybeSend, MaybeSync, UsbBackend, UsbBackendOption, UsbTransfer, create_backend, detect_device,
 };
 
 #[cfg(target_arch = "wasm32")]
