@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::FlashError;
+use crate::lp;
 use crate::progress::{self, FlashEvent};
 use crate::tar::TarArchive;
 use fast_md5::Md5;
@@ -26,6 +27,112 @@ use std::io::{self, SeekFrom};
 use std::path::Path;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+
+// =============================================================================
+// TAR packages
+// =============================================================================
+
+/// Verifies the trailing MD5 checksum appended to `.tar.md5` package files.
+pub async fn verify_md5_footer<R: AsyncRead + AsyncSeek + Unpin>(
+    mut reader: R,
+    name: &str,
+) -> io::Result<()> {
+    let file_size = reader.seek(SeekFrom::End(0)).await?;
+
+    if file_size < 34 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "File is too small to contain a valid MD5 footer",
+        ));
+    }
+
+    // Read the last 512 bytes of the file. Since the TAR file must end with at least
+    // two blocks of zeroes, the last null byte (0x00) marks the exact boundary
+    // between the TAR payload and the appended plain-text MD5 footer.
+    let seek_pos = file_size.saturating_sub(512);
+    reader.seek(SeekFrom::Start(seek_pos)).await?;
+    let mut last_bytes = vec![0u8; (file_size - seek_pos) as usize];
+    reader.read_exact(&mut last_bytes).await?;
+
+    // Find the last null byte (0x00)
+    let mut last_null_idx = None;
+    for i in (0..last_bytes.len()).rev() {
+        if last_bytes[i] == 0 {
+            last_null_idx = Some(i);
+            break;
+        }
+    }
+
+    let Some(null_idx) = last_null_idx else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Could not find a valid null separator for the MD5 footer",
+        ));
+    };
+
+    let footer_start = null_idx + 1;
+    let footer_bytes = &last_bytes[footer_start..];
+    let footer_str = String::from_utf8_lossy(footer_bytes);
+    let footer_line = footer_str.lines().last().unwrap_or_default();
+
+    if footer_line.len() < 32 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Could not find a valid MD5 checksum at the end of the file",
+        ));
+    }
+
+    let expected_hex = &footer_line[..32];
+    let mut expected_bytes = [0u8; 16];
+    for i in 0..16 {
+        let hex_byte = &expected_hex[i * 2..i * 2 + 2];
+        expected_bytes[i] = u8::from_str_radix(hex_byte, 16)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    }
+
+    // The payload size is the exact position up to the MD5 footer text
+    let payload_size = file_size - footer_line.len() as u64 - 1;
+
+    crate::progress::on_event(FlashEvent::Md5Start {
+        name,
+        size: payload_size,
+    });
+
+    let res: io::Result<()> = async {
+        // Reset file pointer and compute MD5 over the payload only
+        reader.seek(SeekFrom::Start(0)).await?;
+        let mut hasher = Md5::new();
+        let mut buffer = [0u8; 128 * 1024];
+        let mut remaining = payload_size;
+
+        while remaining > 0 {
+            let to_read = std::cmp::min(remaining, buffer.len() as u64) as usize;
+            reader.read_exact(&mut buffer[..to_read]).await?;
+            hasher.update(&buffer[..to_read]);
+            crate::progress::inc(to_read as u64);
+            remaining -= to_read as u64;
+        }
+
+        let calculated_digest = hasher.finalize();
+        if calculated_digest != expected_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "MD5 verification failed! File is corrupted or modified.",
+            ));
+        }
+
+        Ok(())
+    }
+    .await;
+
+    if res.is_err() {
+        crate::progress::on_event(FlashEvent::Md5Fail(name));
+    } else {
+        crate::progress::on_event(FlashEvent::Md5End(name));
+    }
+
+    res
+}
 
 /// A file inside a TAR package.
 #[derive(Clone, Debug)]
@@ -207,110 +314,339 @@ pub(crate) fn normalize_basename(path_str: &str) -> (String, bool) {
     }
 }
 
-// This is asserted by Lz4FrameHeader so the header size is always 15
-const LZ4_HEADER_SIZE: usize = 15;
+// =============================================================================
+// Firmware images
+// =============================================================================
 
-/// Verifies the trailing MD5 checksum appended to `.tar.md5` package files.
-pub async fn verify_md5_footer<R: AsyncRead + AsyncSeek + Unpin>(
-    mut reader: R,
-    name: &str,
-) -> io::Result<()> {
-    let file_size = reader.seek(SeekFrom::End(0)).await?;
-
-    if file_size < 34 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "File is too small to contain a valid MD5 footer",
-        ));
-    }
-
-    // Read the last 512 bytes of the file. Since the TAR file must end with at least
-    // two blocks of zeroes, the last null byte (0x00) marks the exact boundary
-    // between the TAR payload and the appended plain-text MD5 footer.
-    let seek_pos = file_size.saturating_sub(512);
-    reader.seek(SeekFrom::Start(seek_pos)).await?;
-    let mut last_bytes = vec![0u8; (file_size - seek_pos) as usize];
-    reader.read_exact(&mut last_bytes).await?;
-
-    // Find the last null byte (0x00)
-    let mut last_null_idx = None;
-    for i in (0..last_bytes.len()).rev() {
-        if last_bytes[i] == 0 {
-            last_null_idx = Some(i);
-            break;
-        }
-    }
-
-    let Some(null_idx) = last_null_idx else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Could not find a valid null separator for the MD5 footer",
-        ));
-    };
-
-    let footer_start = null_idx + 1;
-    let footer_bytes = &last_bytes[footer_start..];
-    let footer_str = String::from_utf8_lossy(footer_bytes);
-    let footer_line = footer_str.lines().last().unwrap_or_default();
-
-    if footer_line.len() < 32 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Could not find a valid MD5 checksum at the end of the file",
-        ));
-    }
-
-    let expected_hex = &footer_line[..32];
-    let mut expected_bytes = [0u8; 16];
-    for i in 0..16 {
-        let hex_byte = &expected_hex[i * 2..i * 2 + 2];
-        expected_bytes[i] = u8::from_str_radix(hex_byte, 16)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    }
-
-    // The payload size is the exact position up to the MD5 footer text
-    let payload_size = file_size - footer_line.len() as u64 - 1;
-
-    crate::progress::on_event(FlashEvent::Md5Start {
-        name,
-        size: payload_size,
-    });
-
-    let res: io::Result<()> = async {
-        // Reset file pointer and compute MD5 over the payload only
-        reader.seek(SeekFrom::Start(0)).await?;
-        let mut hasher = Md5::new();
-        let mut buffer = [0u8; 128 * 1024];
-        let mut remaining = payload_size;
-
-        while remaining > 0 {
-            let to_read = std::cmp::min(remaining, buffer.len() as u64) as usize;
-            reader.read_exact(&mut buffer[..to_read]).await?;
-            hasher.update(&buffer[..to_read]);
-            crate::progress::inc(to_read as u64);
-            remaining -= to_read as u64;
-        }
-
-        let calculated_digest = hasher.finalize();
-        if calculated_digest != expected_bytes {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "MD5 verification failed! File is corrupted or modified.",
-            ));
-        }
-
-        Ok(())
-    }
-    .await;
-
-    if res.is_err() {
-        crate::progress::on_event(FlashEvent::Md5Fail(name));
-    } else {
-        crate::progress::on_event(FlashEvent::Md5End(name));
-    }
-
-    res
+/// Where the bytes of a firmware image are stored.
+///
+/// Rather than owning or borrowing a reader, `Package` and `Image` store indices into
+/// [`FirmwareReaders`]. Multiple images typically come from the same TAR package, and
+/// reading requires `&mut R`, so they could not each hold a mutable borrow of it.
+/// [`FirmwareReaders::open`] instead borrows and seeks the reader on demand, one image
+/// at a time.
+#[derive(Clone)]
+pub(crate) enum ImageSource {
+    /// Entry inside a TAR package.
+    Package {
+        /// Index into [`FirmwareReaders::packages`].
+        index: usize,
+        /// Byte offset where the entry's data starts within the package.
+        offset: u64,
+        /// Size of the entry's data in bytes.
+        size: u64,
+    },
+    /// Standalone partition image.
+    Image {
+        /// Index into [`FirmwareReaders::partitions`].
+        index: usize,
+        /// Size of the image in bytes.
+        size: u64,
+    },
+    /// In-memory buffer (e.g. a rewritten vbmeta image).
+    Memory(Vec<u8>),
 }
+
+impl ImageSource {
+    /// Returns the size of the stored bytes.
+    pub(crate) fn size(&self) -> u64 {
+        match self {
+            Self::Package { size, .. } | Self::Image { size, .. } => *size,
+            Self::Memory(data) => data.len() as u64,
+        }
+    }
+}
+
+/// The readers backing firmware images: TAR packages and standalone partition images.
+pub(crate) struct FirmwareReaders<P, I> {
+    /// TAR packages as `(name, reader)`.
+    pub(crate) packages: Vec<(String, P)>,
+    /// Standalone partition images as `(target_partition, filename, reader)`.
+    pub(crate) partitions: Vec<(Option<String>, String, I)>,
+}
+
+impl<P, I> Default for FirmwareReaders<P, I> {
+    fn default() -> Self {
+        Self {
+            packages: Vec::new(),
+            partitions: Vec::new(),
+        }
+    }
+}
+
+impl<P, I> FirmwareReaders<P, I> {
+    /// Returns whether there are no packages and no partition images.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.packages.is_empty() && self.partitions.is_empty()
+    }
+}
+
+impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FirmwareReaders<P, I> {
+    /// Positions and returns a size-bounded reader over the bytes stored in `source`.
+    pub(crate) async fn open<'a>(
+        &'a mut self,
+        source: &'a ImageSource,
+    ) -> io::Result<impl AsyncRead + Unpin + 'a> {
+        let reader = match source {
+            ImageSource::Package { index, offset, .. } => {
+                let reader = &mut self.packages[*index].1;
+                reader.seek(SeekFrom::Start(*offset)).await?;
+                SourceReader::Package(reader)
+            }
+            ImageSource::Image { index, .. } => {
+                let reader = &mut self.partitions[*index].2;
+                reader.seek(SeekFrom::Start(0)).await?;
+                SourceReader::Image(reader)
+            }
+            ImageSource::Memory(data) => SourceReader::Memory(Cursor::new(data.as_slice())),
+        };
+        Ok(reader.take(source.size()))
+    }
+}
+
+enum SourceReader<'a, P, I> {
+    Package(&'a mut P),
+    Image(&'a mut I),
+    Memory(Cursor<&'a [u8]>),
+}
+
+impl<P: AsyncRead + Unpin, I: AsyncRead + Unpin> AsyncRead for SourceReader<'_, P, I> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        match &mut *self {
+            Self::Package(r) => Pin::new(r).poll_read(cx, buf),
+            Self::Image(r) => Pin::new(r).poll_read(cx, buf),
+            Self::Memory(c) => Pin::new(c).poll_read(cx, buf),
+        }
+    }
+}
+
+/// The bytes of a partition image and how they are encoded, independent of any PIT.
+#[derive(Clone)]
+pub(crate) struct FirmwareImage {
+    /// Backing source for the image bytes.
+    pub(crate) source: ImageSource,
+    /// Metadata header of the LZ4 frame if the image is LZ4-compressed.
+    pub(crate) lz4_header: Option<Lz4FrameHeader>,
+}
+
+impl FirmwareImage {
+    /// Inspects the image stored in `source`, parsing its LZ4 frame header if
+    /// `is_lz4` is set.
+    pub(crate) async fn inspect<P, I>(
+        source: ImageSource,
+        is_lz4: bool,
+        readers: &mut FirmwareReaders<P, I>,
+    ) -> io::Result<Self>
+    where
+        P: AsyncRead + AsyncSeek + Unpin,
+        I: AsyncRead + AsyncSeek + Unpin,
+    {
+        let lz4_header = if is_lz4 {
+            let reader = readers.open(&source).await?;
+            Some(Lz4FrameHeader::parse(reader).await?)
+        } else {
+            None
+        };
+        Ok(Self { source, lz4_header })
+    }
+
+    /// Opens a size-bounded reader over the raw (possibly compressed) bytes of the image.
+    pub(crate) async fn open<'a, P, I>(
+        &'a self,
+        readers: &'a mut FirmwareReaders<P, I>,
+    ) -> io::Result<impl AsyncRead + Unpin + 'a>
+    where
+        P: AsyncRead + AsyncSeek + Unpin,
+        I: AsyncRead + AsyncSeek + Unpin,
+    {
+        readers.open(&self.source).await
+    }
+
+    /// Parses the LP metadata of a super image to determine its used size in sectors,
+    /// returning `None` if it cannot be read.
+    pub(crate) async fn super_used_size<P, I>(
+        &self,
+        readers: &mut FirmwareReaders<P, I>,
+    ) -> Option<u32>
+    where
+        P: AsyncRead + AsyncSeek + Unpin,
+        I: AsyncRead + AsyncSeek + Unpin,
+    {
+        let prefix = self
+            .read_prefix(readers, lp::SUPER_METADATA_PREFIX_SIZE)
+            .await
+            .ok()?;
+        lp::inspect_super_bytes(&prefix)
+    }
+
+    /// Reads up to `limit` bytes from the start of the image, decompressing it if needed.
+    async fn read_prefix<P, I>(
+        &self,
+        readers: &mut FirmwareReaders<P, I>,
+        limit: usize,
+    ) -> io::Result<Vec<u8>>
+    where
+        P: AsyncRead + AsyncSeek + Unpin,
+        I: AsyncRead + AsyncSeek + Unpin,
+    {
+        let mut reader = self.open(readers).await?;
+        let prefix = if self.lz4_header.is_some() {
+            std::pin::pin!(self.decompressed_slices(&mut reader, limit))
+                .next()
+                .await
+        } else {
+            std::pin::pin!(self.slices(&mut reader, limit)).next().await
+        };
+        prefix.unwrap_or_else(|| Ok(Vec::new()))
+    }
+
+    /// Raw (possibly compressed) size of the image in bytes.
+    pub(crate) fn size(&self) -> u64 {
+        self.source.size()
+    }
+
+    /// Uncompressed size of the image in bytes.
+    pub(crate) fn uncompressed_size(&self) -> u64 {
+        self.lz4_header
+            .as_ref()
+            .map_or_else(|| self.size(), |h| h.content_size)
+    }
+
+    /// Streams raw slices of an uncompressed image.
+    pub(crate) fn slices<'r, R: AsyncRead + Unpin>(
+        &self,
+        reader: &'r mut R,
+        slice_max_bytes: usize,
+    ) -> impl Stream<Item = io::Result<Vec<u8>>> + 'r {
+        stream::unfold(
+            (reader, self.size()),
+            move |(reader, mut remaining)| async move {
+                if remaining == 0 {
+                    return None;
+                }
+                let to_read = remaining.min(slice_max_bytes as u64) as usize;
+                let mut buffer = vec![0u8; to_read];
+                if let Err(e) = reader.read_exact(&mut buffer).await {
+                    return Some((Err(e), (reader, 0)));
+                }
+                remaining -= to_read as u64;
+                Some((Ok(buffer), (reader, remaining)))
+            },
+        )
+    }
+
+    /// Streams LZ4-compressed block slices along with their uncompressed byte sizes.
+    pub(crate) fn compressed_slices<'r, R: AsyncRead + Unpin>(
+        &self,
+        reader: &'r mut R,
+        slice_max_bytes: usize,
+    ) -> impl Stream<Item = io::Result<(usize, Vec<u8>)>> + 'r {
+        let (block_max_size, remaining_decompressed) = self
+            .lz4_header
+            .as_ref()
+            .map_or((0, 0), |h| (h.block_max_size as usize, h.content_size));
+        let max_blocks = slice_max_bytes
+            .checked_div(block_max_size)
+            .map_or(0, |n| n.max(1));
+        let iter = Lz4SliceIterator {
+            reader,
+            block_max_size,
+            max_blocks,
+            remaining_decompressed,
+            started: false,
+            finished: block_max_size == 0,
+        };
+        stream::unfold(iter, |mut it| async move {
+            it.next_slice().await.map(|item| (item, it))
+        })
+    }
+
+    /// Streams decompressed byte slices of an LZ4-compressed image.
+    pub(crate) fn decompressed_slices<'r, R: AsyncRead + Unpin>(
+        &self,
+        reader: &'r mut R,
+        slice_max_bytes: usize,
+    ) -> impl Stream<Item = io::Result<Vec<u8>>> + 'r {
+        let block_max_size = self
+            .lz4_header
+            .as_ref()
+            .map_or(0, |h| h.block_max_size as usize);
+        let iter = Lz4DecompressedSliceIterator {
+            reader,
+            block_max_size,
+            slice_max_bytes,
+            leftover: Vec::new(),
+            started: false,
+            finished: block_max_size == 0,
+        };
+        stream::unfold(iter, |mut it| async move {
+            it.next_slice().await.map(|item| (item, it))
+        })
+    }
+
+    /// Reads the entire image, decompressing it if needed.
+    pub(crate) async fn read_all<P, I>(
+        &self,
+        readers: &mut FirmwareReaders<P, I>,
+    ) -> io::Result<Vec<u8>>
+    where
+        P: AsyncRead + AsyncSeek + Unpin,
+        I: AsyncRead + AsyncSeek + Unpin,
+    {
+        let mut reader = self.open(readers).await?;
+        let reader = &mut reader;
+        if let Some(header) = &self.lz4_header {
+            let mut data = Vec::new();
+            let content_size = header.content_size;
+            let slice_size = (header.block_max_size as usize).max(64 * 1024);
+            let mut slices = std::pin::pin!(self.decompressed_slices(reader, slice_size));
+            while let Some(slice) = slices.next().await {
+                data.extend_from_slice(&slice?);
+            }
+            if data.len() as u64 != content_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "LZ4 content size mismatch: expected {}, got {}",
+                        content_size,
+                        data.len()
+                    ),
+                ));
+            }
+            Ok(data)
+        } else {
+            let size = self.size();
+            let mut data = Vec::new();
+            reader.take(size).read_to_end(&mut data).await?;
+            if data.len() as u64 != size {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "unexpected EOF while reading partition payload",
+                ));
+            }
+            Ok(data)
+        }
+    }
+}
+
+/// A partition image resolved to the PIT entry it will be flashed to.
+pub(crate) struct FirmwarePartitionPayload<'a> {
+    /// PIT partition entry associated with this payload.
+    pub(crate) pit_entry: &'a PitEntry,
+    /// The image to flash.
+    pub(crate) image: FirmwareImage,
+}
+
+// =============================================================================
+// LZ4 frames
+// =============================================================================
+
+// Lz4FrameHeader asserts the content size is present, so the header size is always 15
+const LZ4_HEADER_SIZE: usize = 15;
 
 /// Header containing metadata parsed from an LZ4 frame.
 #[derive(Clone, Debug)]
@@ -399,256 +735,6 @@ impl Lz4FrameHeader {
             content_size,
             block_max_size,
         })
-    }
-}
-
-/// Backing byte source for a planned partition payload.
-///
-/// Rather than owning or holding a mutable borrow of a reader directly, `Package` and
-/// `Image` store indices into [`FlashConfig`](crate::FlashConfig)'s `packages` and
-/// `partitions` lists. Multiple planned partitions typically originate from the same
-/// TAR archive, and reading requires `&mut R`, so Rust's borrow rules prevent multiple
-/// [`FirmwarePartitionPayload`] items from simultaneously holding `&mut R` references to
-/// the same underlying archive reader. Storing the index allows
-/// [`FirmwarePartitionSource::open_reader`] to borrow and seek the appropriate reader on
-/// demand one partition at a time.
-#[derive(Clone)]
-pub(crate) enum FirmwarePartitionSource {
-    /// Entry inside a TAR package archive.
-    Package {
-        /// Index into `FlashConfig::packages`.
-        index: usize,
-        /// Byte offset where the entry's payload starts within the TAR archive.
-        offset: u64,
-        /// Raw byte length of the entry in the TAR archive.
-        size: u64,
-    },
-    /// Standalone partition image.
-    Image {
-        /// Index into `FlashConfig::partitions`.
-        index: usize,
-        /// Total byte length of the standalone partition image.
-        size: u64,
-    },
-    /// In-memory byte buffer (e.g. rewritten vbmeta image).
-    Memory(Vec<u8>),
-}
-
-impl FirmwarePartitionSource {
-    /// Returns the raw byte length of the payload in its backing source.
-    pub(crate) fn size(&self) -> u64 {
-        match self {
-            Self::Package { size, .. } | Self::Image { size, .. } => *size,
-            Self::Memory(data) => data.len() as u64,
-        }
-    }
-
-    /// Positions and returns a size-bounded reader at the start of this partition's payload.
-    pub(crate) async fn open_reader<
-        'a,
-        P: AsyncRead + AsyncSeek + Unpin,
-        I: AsyncRead + AsyncSeek + Unpin,
-    >(
-        &'a self,
-        packages: &'a mut [(String, P)],
-        partitions: &'a mut [(Option<String>, String, I)],
-    ) -> io::Result<impl AsyncRead + Unpin + 'a> {
-        let reader = match self {
-            Self::Package { index, offset, .. } => {
-                let reader = &mut packages[*index].1;
-                reader.seek(SeekFrom::Start(*offset)).await?;
-                SourceReader::Package(reader)
-            }
-            Self::Image { index, .. } => {
-                let reader = &mut partitions[*index].2;
-                reader.seek(SeekFrom::Start(0)).await?;
-                SourceReader::Image(reader)
-            }
-            Self::Memory(data) => SourceReader::Memory(Cursor::new(data.as_slice())),
-        };
-        Ok(reader.take(self.size()))
-    }
-}
-
-enum SourceReader<'a, P, I> {
-    Package(&'a mut P),
-    Image(&'a mut I),
-    Memory(Cursor<&'a [u8]>),
-}
-
-impl<P: AsyncRead + Unpin, I: AsyncRead + Unpin> AsyncRead for SourceReader<'_, P, I> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<io::Result<usize>> {
-        match &mut *self {
-            Self::Package(r) => Pin::new(r).poll_read(cx, buf),
-            Self::Image(r) => Pin::new(r).poll_read(cx, buf),
-            Self::Memory(c) => Pin::new(c).poll_read(cx, buf),
-        }
-    }
-}
-
-/// A partition image resolved to the PIT entry it will be flashed to.
-pub(crate) struct FirmwarePartitionPayload<'a> {
-    /// PIT partition entry associated with this payload.
-    pub(crate) pit_entry: &'a PitEntry,
-    /// The image to flash.
-    pub(crate) image: FirmwareImage,
-}
-
-/// The bytes of a partition image and how they are encoded, independent of any PIT.
-#[derive(Clone)]
-pub(crate) struct FirmwareImage {
-    /// Backing source for the image bytes.
-    pub(crate) source: FirmwarePartitionSource,
-    /// Metadata header of the LZ4 frame if the image is LZ4-compressed.
-    pub(crate) lz4_header: Option<Lz4FrameHeader>,
-}
-
-impl FirmwareImage {
-    /// Inspects the image stored in `source`, parsing its LZ4 frame header if
-    /// `is_lz4` is set.
-    pub(crate) async fn inspect<P, I>(
-        source: FirmwarePartitionSource,
-        is_lz4: bool,
-        packages: &mut [(String, P)],
-        partitions: &mut [(Option<String>, String, I)],
-    ) -> io::Result<Self>
-    where
-        P: AsyncRead + AsyncSeek + Unpin,
-        I: AsyncRead + AsyncSeek + Unpin,
-    {
-        let lz4_header = if is_lz4 {
-            let reader = source.open_reader(packages, partitions).await?;
-            Some(Lz4FrameHeader::parse(reader).await?)
-        } else {
-            None
-        };
-        Ok(Self { source, lz4_header })
-    }
-
-    /// Total raw size of the payload in bytes in its backing source.
-    pub(crate) fn size(&self) -> u64 {
-        self.source.size()
-    }
-
-    /// Total uncompressed size of the payload in bytes.
-    pub(crate) fn uncompressed_size(&self) -> u64 {
-        self.lz4_header
-            .as_ref()
-            .map_or_else(|| self.size(), |h| h.content_size)
-    }
-
-    /// Streams raw slices of an uncompressed partition payload.
-    pub(crate) fn slices<'r, R: AsyncRead + Unpin>(
-        &self,
-        reader: &'r mut R,
-        slice_max_bytes: usize,
-    ) -> impl Stream<Item = io::Result<Vec<u8>>> + 'r {
-        stream::unfold(
-            (reader, self.size()),
-            move |(reader, mut remaining)| async move {
-                if remaining == 0 {
-                    return None;
-                }
-                let to_read = remaining.min(slice_max_bytes as u64) as usize;
-                let mut buffer = vec![0u8; to_read];
-                if let Err(e) = reader.read_exact(&mut buffer).await {
-                    return Some((Err(e), (reader, 0)));
-                }
-                remaining -= to_read as u64;
-                Some((Ok(buffer), (reader, remaining)))
-            },
-        )
-    }
-
-    /// Streams LZ4-compressed block slices along with their uncompressed byte sizes.
-    pub(crate) fn compressed_slices<'r, R: AsyncRead + Unpin>(
-        &self,
-        reader: &'r mut R,
-        slice_max_bytes: usize,
-    ) -> impl Stream<Item = io::Result<(usize, Vec<u8>)>> + 'r {
-        let (block_max_size, remaining_decompressed) = self
-            .lz4_header
-            .as_ref()
-            .map_or((0, 0), |h| (h.block_max_size as usize, h.content_size));
-        let max_blocks = slice_max_bytes
-            .checked_div(block_max_size)
-            .map_or(0, |n| n.max(1));
-        let iter = Lz4SliceIterator {
-            reader,
-            block_max_size,
-            max_blocks,
-            remaining_decompressed,
-            started: false,
-            finished: block_max_size == 0,
-        };
-        stream::unfold(iter, |mut it| async move {
-            it.next_slice().await.map(|item| (item, it))
-        })
-    }
-
-    /// Streams decompressed byte slices from an LZ4-compressed partition payload.
-    pub(crate) fn decompressed_slices<'r, R: AsyncRead + Unpin>(
-        &self,
-        reader: &'r mut R,
-        slice_max_bytes: usize,
-    ) -> impl Stream<Item = io::Result<Vec<u8>>> + 'r {
-        let block_max_size = self
-            .lz4_header
-            .as_ref()
-            .map_or(0, |h| h.block_max_size as usize);
-        let iter = Lz4DecompressedSliceIterator {
-            reader,
-            block_max_size,
-            slice_max_bytes,
-            leftover: Vec::new(),
-            started: false,
-            finished: block_max_size == 0,
-        };
-        stream::unfold(iter, |mut it| async move {
-            it.next_slice().await.map(|item| (item, it))
-        })
-    }
-
-    /// Reads the entire payload content, decompressing it if needed.
-    pub(crate) async fn read_all<R: AsyncRead + Unpin>(
-        &self,
-        reader: &mut R,
-    ) -> io::Result<Vec<u8>> {
-        if let Some(header) = &self.lz4_header {
-            let mut data = Vec::new();
-            let content_size = header.content_size;
-            let slice_size = (header.block_max_size as usize).max(64 * 1024);
-            let mut slices = std::pin::pin!(self.decompressed_slices(reader, slice_size));
-            while let Some(slice) = slices.next().await {
-                data.extend_from_slice(&slice?);
-            }
-            if data.len() as u64 != content_size {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "LZ4 content size mismatch: expected {}, got {}",
-                        content_size,
-                        data.len()
-                    ),
-                ));
-            }
-            Ok(data)
-        } else {
-            let size = self.size();
-            let mut data = Vec::new();
-            reader.take(size).read_to_end(&mut data).await?;
-            if data.len() as u64 != size {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "unexpected EOF while reading partition payload",
-                ));
-            }
-            Ok(data)
-        }
     }
 }
 
@@ -964,22 +1050,20 @@ pub(crate) mod tests {
             assert_eq!(header.block_max_size, 64 * 1024);
 
             let image = FirmwareImage {
-                source: FirmwarePartitionSource::Image {
+                source: ImageSource::Image {
                     index: 0,
                     size: compressed.len() as u64,
                 },
                 lz4_header: Some(header),
             };
-            let mut packages: [(String, Cursor<&[u8]>); 0] = [];
-            let mut partitions = [(None, "test.img.lz4".to_string(), cursor)];
+            let mut readers: FirmwareReaders<Cursor<&[u8]>, _> = FirmwareReaders {
+                packages: Vec::new(),
+                partitions: vec![(None, "test.img.lz4".to_string(), cursor)],
+            };
 
-            // 1. Read a partial prefix and drop the stream (simulating inspect_super_partition)
+            // 1. Read a partial prefix and drop the stream (like reading super metadata)
             {
-                let mut reader = image
-                    .source
-                    .open_reader(&mut packages, &mut partitions)
-                    .await
-                    .unwrap();
+                let mut reader = image.open(&mut readers).await.unwrap();
                 let prefix = std::pin::pin!(image.decompressed_slices(&mut reader, 10 * 1024))
                     .next()
                     .await
@@ -989,14 +1073,10 @@ pub(crate) mod tests {
             }
 
             // 2. Consume full stream with a 50 KB slice limit (unaligned with 64 KB blocks,
-            // exercising both open_reader rewind and leftover buffering)
+            // exercising both the rewind when opening and leftover buffering)
             let mut reassembled = Vec::new();
             {
-                let mut reader = image
-                    .source
-                    .open_reader(&mut packages, &mut partitions)
-                    .await
-                    .unwrap();
+                let mut reader = image.open(&mut readers).await.unwrap();
                 let mut slices = std::pin::pin!(image.decompressed_slices(&mut reader, 50 * 1024));
                 while let Some(res) = slices.next().await {
                     let slice = res.unwrap();

@@ -17,10 +17,9 @@
 use crate::FlashError;
 use crate::avb;
 use crate::firmware::{
-    FirmwareImage, FirmwarePartitionPayload, FirmwarePartitionSource, PackageIndex,
+    FirmwareImage, FirmwarePartitionPayload, FirmwareReaders, ImageSource, PackageIndex,
     normalize_basename, verify_md5_footer,
 };
-use crate::lp::inspect_super_partition;
 use crate::odin::{OdinSession, parse_sales_code};
 use crate::progress::{self, FlashEvent};
 use futures::io::{AsyncRead, AsyncSeek, AsyncSeekExt, Cursor};
@@ -131,8 +130,7 @@ impl FlashOptions {
 pub struct FlashConfig<P = Cursor<&'static [u8]>, I = Cursor<&'static [u8]>> {
     options: FlashOptions,
     pit: Option<Vec<u8>>,
-    packages: Vec<(String, P)>,
-    partitions: Vec<(Option<String>, String, I)>,
+    readers: FirmwareReaders<P, I>,
 }
 
 impl FlashConfig {
@@ -141,8 +139,7 @@ impl FlashConfig {
         Self {
             options: FlashOptions::default(),
             pit: None,
-            packages: Vec::new(),
-            partitions: Vec::new(),
+            readers: FirmwareReaders::default(),
         }
     }
 }
@@ -200,11 +197,13 @@ impl<P, I> FlashConfig<P, I> {
         FlashConfig {
             options: self.options,
             pit: self.pit,
-            packages: packages
-                .into_iter()
-                .map(|(name, reader)| (name.into(), reader))
-                .collect(),
-            partitions: self.partitions,
+            readers: FirmwareReaders {
+                packages: packages
+                    .into_iter()
+                    .map(|(name, reader)| (name.into(), reader))
+                    .collect(),
+                partitions: self.readers.partitions,
+            },
         }
     }
 
@@ -216,11 +215,13 @@ impl<P, I> FlashConfig<P, I> {
         FlashConfig {
             options: self.options,
             pit: self.pit,
-            packages: self.packages,
-            partitions: partitions
-                .into_iter()
-                .map(|(part, name, reader)| (part, name.into(), reader))
-                .collect(),
+            readers: FirmwareReaders {
+                packages: self.readers.packages,
+                partitions: partitions
+                    .into_iter()
+                    .map(|(part, name, reader)| (part, name.into(), reader))
+                    .collect(),
+            },
         }
     }
 
@@ -274,21 +275,19 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashCo
         let Self {
             options,
             pit,
-            mut packages,
-            mut partitions,
+            mut readers,
         } = self;
 
         if let Some(sales_code) = &options.sales_code {
             parse_sales_code(sales_code)?;
         }
 
-        if packages.is_empty() && partitions.is_empty() && pit.is_none() {
+        if readers.is_empty() && pit.is_none() {
             options.warn_unused();
             return Ok(FlashBlueprint {
                 options,
                 pit,
-                packages,
-                partitions,
+                readers,
                 images: Vec::new(),
                 super_used_size: None,
                 has_download_list: false,
@@ -296,7 +295,7 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashCo
         }
 
         if !options.skip_md5 {
-            for (name, reader) in &mut packages {
+            for (name, reader) in &mut readers.packages {
                 if name.to_lowercase().ends_with(".md5") {
                     verify_md5_footer(&mut *reader, name)
                         .await
@@ -305,23 +304,22 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashCo
             }
         }
 
-        let index = PackageIndex::scan(&mut packages, pit.is_none()).await?;
+        let index = PackageIndex::scan(&mut readers.packages, pit.is_none()).await?;
         let pit = pit.or(index.pit_bytes);
         if let Some(pit_bytes) = &pit {
             PitData::new(pit_bytes).map_err(FlashError::PitUnpackFailed)?;
         }
 
-        let mut images = Vec::with_capacity(index.entries.len() + partitions.len());
+        let mut images = Vec::with_capacity(index.entries.len() + readers.partitions.len());
         for entry in index.entries {
-            let source = FirmwarePartitionSource::Package {
+            let source = ImageSource::Package {
                 index: entry.package_index,
                 offset: entry.offset,
                 size: entry.size,
             };
-            let image =
-                FirmwareImage::inspect(source, entry.is_lz4, &mut packages, &mut partitions)
-                    .await
-                    .map_err(|e| FlashError::Lz4Header(entry.original_name.clone(), e))?;
+            let image = FirmwareImage::inspect(source, entry.is_lz4, &mut readers)
+                .await
+                .map_err(|e| FlashError::Lz4Header(entry.original_name.clone(), e))?;
             images.push(PlannedImage {
                 target: Target::File(entry.normalized_name),
                 display_name: entry.original_name,
@@ -330,8 +328,8 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashCo
             });
         }
 
-        for index in 0..partitions.len() {
-            let (part_name, filename, reader) = &mut partitions[index];
+        for index in 0..readers.partitions.len() {
+            let (part_name, filename, reader) = &mut readers.partitions[index];
             let (normalized_name, is_lz4) = normalize_basename(filename);
             let target = match part_name {
                 None => Target::File(normalized_name),
@@ -345,8 +343,8 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashCo
                 .seek(SeekFrom::End(0))
                 .await
                 .map_err(|e| FlashError::FileReadFailed(display_name.clone(), e))?;
-            let source = FirmwarePartitionSource::Image { index, size };
-            let image = FirmwareImage::inspect(source, is_lz4, &mut packages, &mut partitions)
+            let source = ImageSource::Image { index, size };
+            let image = FirmwareImage::inspect(source, is_lz4, &mut readers)
                 .await
                 .map_err(|e| FlashError::Lz4Header(display_name.clone(), e))?;
             images.push(PlannedImage {
@@ -359,16 +357,14 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashCo
 
         if index.super_used_size.is_none() {
             for planned in images.iter_mut().filter(|i| i.target.is_super()) {
-                planned.super_used_size =
-                    inspect_super_image(&planned.image, &mut packages, &mut partitions).await;
+                planned.super_used_size = planned.image.super_used_size(&mut readers).await;
             }
         }
 
         Ok(FlashBlueprint {
             options,
             pit,
-            packages,
-            partitions,
+            readers,
             images,
             super_used_size: index.super_used_size,
             has_download_list: index.has_download_list,
@@ -410,7 +406,7 @@ struct PlannedImage {
 impl PlannedImage {
     /// Whether the image is a standalone file rather than a package entry.
     fn is_standalone(&self) -> bool {
-        matches!(self.image.source, FirmwarePartitionSource::Image { .. })
+        matches!(self.image.source, ImageSource::Image { .. })
     }
 }
 
@@ -420,8 +416,7 @@ pub struct FlashBlueprint<P = Cursor<&'static [u8]>, I = Cursor<&'static [u8]>> 
     options: FlashOptions,
     /// PIT to flash, given explicitly or found in a package.
     pit: Option<Vec<u8>>,
-    packages: Vec<(String, P)>,
-    partitions: Vec<(Option<String>, String, I)>,
+    readers: FirmwareReaders<P, I>,
     /// Package entries in order, followed by standalone files.
     images: Vec<PlannedImage>,
     /// Value of `super_used_size.txt`, if present.
@@ -453,7 +448,7 @@ impl<P, I> FlashBlueprint<P, I> {
     }
 
     fn is_empty(&self) -> bool {
-        self.packages.is_empty() && self.partitions.is_empty() && self.pit.is_none()
+        self.readers.is_empty() && self.pit.is_none()
     }
 }
 
@@ -650,19 +645,11 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashBl
             let rewrite_err = |e| FlashError::VbmetaRewriteFailed(name.to_string(), e);
 
             // The patched image is sent uncompressed, bypassing LZ4 passthrough
-            let mut data = {
-                let mut reader = planned
-                    .image
-                    .source
-                    .open_reader(&mut self.packages, &mut self.partitions)
-                    .await
-                    .map_err(rewrite_err)?;
-                planned
-                    .image
-                    .read_all(&mut reader)
-                    .await
-                    .map_err(rewrite_err)?
-            };
+            let mut data = planned
+                .image
+                .read_all(&mut self.readers)
+                .await
+                .map_err(rewrite_err)?;
 
             let Some(offset) =
                 avb::rewrite_vbmeta(&mut data, vbmeta_flags, in_footer).map_err(rewrite_err)?
@@ -684,7 +671,7 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashBl
                 ));
             }
             planned.image = FirmwareImage {
-                source: FirmwarePartitionSource::Memory(data),
+                source: ImageSource::Memory(data),
                 lz4_header: None,
             };
             rewritten = true;
@@ -719,7 +706,7 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashBl
             // Already inspected while pre-planning
             return planned.super_used_size;
         }
-        inspect_super_image(&payload.image, &mut self.packages, &mut self.partitions).await
+        payload.image.super_used_size(&mut self.readers).await
     }
 
     /// Flashes resolved payloads to the device, then ends the session and reboots
@@ -742,7 +729,7 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashBl
             && super_used_size > 0
             && session.bootloader_protocol_version() >= 3
         {
-            let check_size = if self.has_download_list || self.packages.is_empty() {
+            let check_size = if self.has_download_list || self.readers.packages.is_empty() {
                 super_used_size
             } else {
                 0
@@ -764,11 +751,7 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashBl
             });
 
             let res = async {
-                let mut reader = planned
-                    .image
-                    .source
-                    .open_reader(&mut self.packages, &mut self.partitions)
-                    .await?;
+                let mut reader = planned.image.open(&mut self.readers).await?;
                 session.send_partition(&planned, &mut reader).await
             }
             .await;
@@ -795,20 +778,6 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashBl
 
         Ok(())
     }
-}
-
-/// Inspects the LP metadata of a super image, returning `None` if it cannot be read.
-async fn inspect_super_image<P, I>(
-    image: &FirmwareImage,
-    packages: &mut [(String, P)],
-    partitions: &mut [(Option<String>, String, I)],
-) -> Option<u32>
-where
-    P: AsyncRead + AsyncSeek + Unpin,
-    I: AsyncRead + AsyncSeek + Unpin,
-{
-    let mut reader = image.source.open_reader(packages, partitions).await.ok()?;
-    inspect_super_partition(image, &mut reader).await
 }
 
 /// Resolves skip targets into the IDs of the PIT entries they match.
@@ -1109,9 +1078,9 @@ mod tests {
     ) -> Vec<u8> {
         assert!(planned.image.lz4_header.is_none());
         match &planned.image.source {
-            FirmwarePartitionSource::Memory(data) => data.clone(),
-            FirmwarePartitionSource::Image { index, .. } => partitions[*index].get_ref().clone(),
-            FirmwarePartitionSource::Package { .. } => unreachable!(),
+            ImageSource::Memory(data) => data.clone(),
+            ImageSource::Image { index, .. } => partitions[*index].get_ref().clone(),
+            ImageSource::Package { .. } => unreachable!(),
         }
     }
 
@@ -1136,14 +1105,14 @@ mod tests {
             FirmwarePartitionPayload {
                 pit_entry: find_entry(&pit_data, "VBMETA_A"),
                 image: FirmwareImage {
-                    source: FirmwarePartitionSource::Image { index: 0, size },
+                    source: ImageSource::Image { index: 0, size },
                     lz4_header: None,
                 },
             },
             FirmwarePartitionPayload {
                 pit_entry: find_entry(&pit_data, "VBMETA_B"),
                 image: FirmwareImage {
-                    source: FirmwarePartitionSource::Image {
+                    source: ImageSource::Image {
                         index: 1,
                         size: lz4_size,
                     },
@@ -1153,14 +1122,14 @@ mod tests {
             FirmwarePartitionPayload {
                 pit_entry: find_entry(&pit_data, "VBMETA_SYSTEM_A"),
                 image: FirmwareImage {
-                    source: FirmwarePartitionSource::Image { index: 2, size },
+                    source: ImageSource::Image { index: 2, size },
                     lz4_header: None,
                 },
             },
             FirmwarePartitionPayload {
                 pit_entry: find_entry(&pit_data, "BOOT_A"),
                 image: FirmwareImage {
-                    source: FirmwarePartitionSource::Image { index: 3, size },
+                    source: ImageSource::Image { index: 3, size },
                     lz4_header: None,
                 },
             },
@@ -1197,7 +1166,7 @@ mod tests {
         let mut planned = vec![FirmwarePartitionPayload {
             pit_entry: find_entry(&pit_data, "VBMETA_A"),
             image: FirmwareImage {
-                source: FirmwarePartitionSource::Image { index: 0, size },
+                source: ImageSource::Image { index: 0, size },
                 lz4_header: Some(header),
             },
         }];
@@ -1219,7 +1188,7 @@ mod tests {
         let mut planned = vec![FirmwarePartitionPayload {
             pit_entry: find_entry(&pit_data, "VBMETA_A"),
             image: FirmwareImage {
-                source: FirmwarePartitionSource::Image {
+                source: ImageSource::Image {
                     index: 0,
                     size: 4096,
                 },
@@ -1260,7 +1229,7 @@ mod tests {
         let mut planned = vec![FirmwarePartitionPayload {
             pit_entry: find_entry(&pit_data, "BOOT"),
             image: FirmwareImage {
-                source: FirmwarePartitionSource::Image {
+                source: ImageSource::Image {
                     index: 0,
                     size: boot.len() as u64,
                 },
@@ -1273,7 +1242,7 @@ mod tests {
         let mut planned = vec![FirmwarePartitionPayload {
             pit_entry: find_entry(&pit_data, "BOOT"),
             image: FirmwareImage {
-                source: FirmwarePartitionSource::Image {
+                source: ImageSource::Image {
                     index: 0,
                     size: 4096,
                 },
@@ -1959,7 +1928,7 @@ mod tests {
             assert_eq!(resolved.payloads.len(), 1);
             assert!(matches!(
                 resolved.payloads[0].image.source,
-                FirmwarePartitionSource::Package { index: 1, .. }
+                ImageSource::Package { index: 1, .. }
             ));
 
             // Explicit partitions come after packages, so they win
@@ -1977,7 +1946,7 @@ mod tests {
             assert_eq!(resolved.payloads.len(), 1);
             assert!(matches!(
                 resolved.payloads[0].image.source,
-                FirmwarePartitionSource::Image { index: 0, .. }
+                ImageSource::Image { index: 0, .. }
             ));
         });
     }

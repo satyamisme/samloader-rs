@@ -15,10 +15,6 @@
 //! Helper functions for inspecting Android Logical Partition (`liblp`) metadata
 //! and sparse image containers to derive dynamic partition sizing.
 
-use crate::firmware::FirmwareImage;
-use futures::StreamExt;
-use futures::io::AsyncRead;
-
 const SPARSE_HEADER_MAGIC: u32 = 0xed26_ff3a;
 const CHUNK_RAW: u16 = 0xcac1;
 const CHUNK_FILL: u16 = 0xcac2;
@@ -30,31 +26,12 @@ const LP_TARGET_TYPE_LINEAR: u32 = 0;
 const LP_GEOMETRY_OFFSET: usize = 0x1000;
 const LP_PRIMARY_HEADER_OFFSET: usize = 0x3000;
 const REQUIRED_LOGICAL_SIZE: usize = 256 * 1024;
-const DECOMPRESS_PREFIX_LIMIT: usize = 512 * 1024;
 
-/// Inspects a [`FirmwareImage`] of a `SUPER` partition and attempts to parse the active
-/// linear extent sizes to determine the `super_used_size` in sectors.
-pub(crate) async fn inspect_super_partition<R: AsyncRead + Unpin>(
-    image: &FirmwareImage,
-    reader: &mut R,
-) -> Option<u32> {
-    if image.lz4_header.is_some() {
-        let decompressed =
-            std::pin::pin!(image.decompressed_slices(reader, DECOMPRESS_PREFIX_LIMIT))
-                .next()
-                .await?
-                .ok()?;
-        inspect_super_bytes(&decompressed)
-    } else {
-        let prefix = std::pin::pin!(image.slices(reader, DECOMPRESS_PREFIX_LIMIT))
-            .next()
-            .await?
-            .ok()?;
-        inspect_super_bytes(&prefix)
-    }
-}
+/// Number of bytes at the start of a (possibly sparse) super image that are needed
+/// to parse its LP metadata.
+pub(crate) const SUPER_METADATA_PREFIX_SIZE: usize = 512 * 1024;
 
-/// Inspects raw or sparse bytes of a `super.img` payload and extracts the highest
+/// Inspects the raw or sparse bytes at the start of a `super.img` and extracts the highest
 /// allocated sector defined across all linear dynamic partition extents.
 pub(crate) fn inspect_super_bytes(data: &[u8]) -> Option<u32> {
     if data.len() < 4 {
