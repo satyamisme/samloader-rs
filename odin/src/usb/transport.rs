@@ -52,9 +52,4 @@ pub trait UsbBackend: Sized + UsbTransfer {
     async fn find_device<'a, F>(predicate: F) -> Result<Self::UsbDevice, OdinError>
     where
         F: FnMut(u16, u16) -> bool + MaybeSend + 'a;
-
-    /// Searches for a connected device in Download Mode.
-    async fn find_download_device() -> Result<Self::UsbDevice, OdinError> {
-        Self::find_device(|vid, pid| super::SUPPORTED_DEVICES.contains(&(vid, pid))).await
-    }
 }

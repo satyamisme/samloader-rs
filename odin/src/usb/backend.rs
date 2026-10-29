@@ -15,7 +15,6 @@
 
 //! Selection of the USB backend implementation at runtime.
 
-use super::transport::{UsbBackend, UsbTransfer};
 use crate::error::OdinError;
 
 /// Runs `$body` with `$b` bound to the backend type selected by `$option`.
@@ -28,28 +27,29 @@ macro_rules! with_backend {
     ($option:expr, |$b:ident| $body:expr) => {
         match $option {
             #[cfg(feature = "nusb")]
-            UsbBackendOption::Nusb => {
-                type $b = super::NusbBackend;
+            $crate::usb::UsbBackendOption::Nusb => {
+                type $b = $crate::usb::NusbBackend;
                 $body
             }
             #[cfg(feature = "rusb")]
-            UsbBackendOption::Libusb => {
-                type $b = super::RusbBackend;
+            $crate::usb::UsbBackendOption::Libusb => {
+                type $b = $crate::usb::RusbBackend;
                 $body
             }
             #[cfg(feature = "serialport")]
-            UsbBackendOption::Vcom => {
-                type $b = super::SerialBackend;
+            $crate::usb::UsbBackendOption::Vcom => {
+                type $b = $crate::usb::SerialBackend;
                 $body
             }
             #[cfg(mock_backend)]
-            UsbBackendOption::Mock => {
-                type $b = super::MockBackend;
+            $crate::usb::UsbBackendOption::Mock => {
+                type $b = $crate::usb::MockBackend;
                 $body
             }
         }
     };
 }
+pub(crate) use with_backend;
 
 /// Supported USB backend options.
 #[derive(Debug, Clone, Copy)]
@@ -119,28 +119,6 @@ impl UsbBackendOption {
             #[cfg(mock_backend)]
             UsbBackendOption::Mock => "mock",
         }
-    }
-
-    /// Checks whether a device in Download Mode is connected.
-    pub(crate) async fn check_device(self) -> Result<(), OdinError> {
-        with_backend!(self, |B| B::find_download_device().await.map(drop))
-    }
-
-    /// Opens the device in Download Mode.
-    pub(crate) async fn create_transfer(self) -> Result<Box<dyn UsbTransfer>, OdinError> {
-        with_backend!(self, |B| Ok(Box::new(
-            super::open_download_device::<B>().await?
-        )))
-    }
-
-    /// Opens a Samsung device that is not in Download Mode, skipping devices
-    /// that do not expose a usable interface.
-    pub(crate) async fn create_normal_mode_transfer(
-        self,
-    ) -> Result<Box<dyn UsbTransfer>, OdinError> {
-        with_backend!(self, |B| Ok(Box::new(
-            super::open_normal_mode_device::<B>().await?
-        )))
     }
 }
 

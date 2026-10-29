@@ -23,6 +23,7 @@ compile_error!("Feature 'rusb' is not supported when building for WebAssembly!")
 compile_error!("Feature 'serialport' is not supported when building for WebAssembly!");
 
 mod compat;
+mod device;
 mod device_info;
 mod error;
 mod firmware;
@@ -36,16 +37,17 @@ mod usb;
 mod test_util;
 
 pub use compat::{MaybeSend, MaybeSync};
+pub use device::{create_backend, detect_device, query_device_info, reboot_download};
 pub use device_info::{DeviceInfo, SessionDeviceInfo};
 pub use error::{FlashError, LokeError, OdinError};
 pub use firmware::verify_md5_footer;
 pub use flash::{FlashBlueprint, FlashConfig, RebootMode};
-pub use odin::{OdinConnection, OdinSession, query_device_info, reboot_download};
+pub use odin::{OdinConnection, OdinSession};
 pub use progress::{FlashEvent, FlashProgress, clear_progress, set_progress};
-pub use usb::{UsbBackend, UsbBackendOption, UsbTransfer, create_backend, detect_device};
+pub use usb::{UsbBackend, UsbBackendOption, UsbTransfer};
 
 #[cfg(target_arch = "wasm32")]
-pub use usb::{request_device, request_reboot_device};
+pub use device::{request_device, request_reboot_device};
 
 #[cfg(feature = "nusb")]
 pub use usb::NusbBackend;

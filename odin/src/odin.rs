@@ -696,51 +696,6 @@ pub(crate) fn parse_sales_code(sales_code: &str) -> Result<[u8; 3], OdinError> {
     }
 }
 
-/// Triggers a reboot of the connected Samsung device into Download Mode via the
-/// specified backend protocol.
-///
-/// The AT command is sent to the first Samsung device not already in Download
-/// Mode that exposes a usable interface; unrelated Samsung USB devices are
-/// skipped. If no such device can be opened but one is already in Download
-/// Mode, this is a no-op.
-///
-/// On WASM, the device must first be paired with `request_reboot_device`.
-pub async fn reboot_download(usb_backend: crate::usb::UsbBackendOption) -> Result<(), OdinError> {
-    let mut backend = match usb_backend.create_normal_mode_transfer().await {
-        Ok(backend) => backend,
-        Err(e) => {
-            // The error may come from an unrelated device of the same vendor,
-            // so check for a device already in Download Mode before reporting it.
-            if usb_backend.check_device().await.is_ok() {
-                if !matches!(e, OdinError::NormalModeDeviceNotFound) {
-                    crate::progress::println_verbose(&format!("Ignoring error: {e}"));
-                }
-                crate::progress::println("Device is already in Download Mode.");
-                return Ok(());
-            }
-            return Err(e);
-        }
-    };
-
-    let cmd: &[u8] = b"AT+SUDDLMOD=0,0\r";
-
-    if !backend.send_data(cmd, 1000).await {
-        return Err(OdinError::SerialError("Failed to send data".to_string()));
-    }
-
-    Ok(())
-}
-
-/// Connects to a device in download mode and queries diagnostic info via `DVIF`.
-pub async fn query_device_info(
-    usb_backend: crate::usb::UsbBackendOption,
-    wait: bool,
-) -> Result<DeviceInfo, OdinError> {
-    let usb = crate::usb::create_backend(usb_backend, wait).await?;
-    let mut conn = OdinConnection::new(usb);
-    conn.query_device_info().await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

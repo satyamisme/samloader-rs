@@ -69,7 +69,7 @@ pub trait FlashProgress: MaybeSend + MaybeSync {
         false
     }
 
-    /// Prints a verbose diagnostic message from the USB transport layer.
+    /// Prints a verbose diagnostic message from the USB device and transport layers.
     /// Defaults to [`println_verbose`](Self::println_verbose).
     fn eprintln_verbose(&self, msg: &str) {
         self.println_verbose(msg);
@@ -169,7 +169,8 @@ pub(crate) fn is_verbose() -> bool {
     with_progress(|p| p.is_verbose())
 }
 
-/// Prints a verbose diagnostic message from the USB transport layer through the active progress reporter.
+/// Prints a verbose diagnostic message from the USB device and transport layers
+/// through the active progress reporter.
 pub(crate) fn eprintln_verbose(msg: &str) {
     with_progress(|p| p.eprintln_verbose(msg));
 }
