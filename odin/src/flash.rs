@@ -15,15 +15,16 @@
 // limitations under the License.
 
 use crate::FlashError;
+use crate::error::OdinError;
 use crate::firmware::avb;
 use crate::firmware::{
-    FirmwareImage, FirmwarePartitionPayload, FirmwareReaders, ImageSource, PackageIndex,
-    normalize_basename, verify_md5_footer,
+    FirmwareImage, FirmwareReaders, ImageSource, PackageIndex, normalize_basename,
+    verify_md5_footer,
 };
 use crate::progress::{self, FlashEvent};
-use crate::session::{OdinSession, parse_sales_code};
+use crate::session::{MAX_SLICE_SIZE, OdinSession, parse_sales_code};
 use futures::io::{AsyncRead, AsyncSeek, AsyncSeekExt, Cursor};
-use samloader_pit::PitData;
+use samloader_pit::{PitData, PitEntry};
 use std::collections::HashSet;
 use std::io::SeekFrom;
 
@@ -425,6 +426,48 @@ impl<P, I> FlashBlueprint<P, I> {
     }
 }
 
+/// A partition image resolved to the PIT entry it will be flashed to.
+struct FirmwarePartitionPayload<'a> {
+    /// PIT partition entry associated with this payload.
+    pit_entry: &'a PitEntry,
+    /// The image to flash.
+    image: FirmwareImage,
+}
+
+impl FirmwarePartitionPayload<'_> {
+    /// Streams the image to its partition, passing LZ4 blocks through when the
+    /// device accepts them and decompressing them on the fly otherwise.
+    async fn send<P, I>(
+        &self,
+        session: &mut OdinSession,
+        readers: &mut FirmwareReaders<P, I>,
+    ) -> Result<(), OdinError>
+    where
+        P: AsyncRead + AsyncSeek + Unpin,
+        I: AsyncRead + AsyncSeek + Unpin,
+    {
+        let image = &self.image;
+        let mut reader = image.open(readers).await?;
+        match &image.lz4_header {
+            None => {
+                progress::set_length(image.size());
+                let slices = image.slices(&mut reader, MAX_SLICE_SIZE);
+                session.send_slices(self.pit_entry, slices).await
+            }
+            Some(header) if session.accepts_lz4_blocks(header.block_max_size) => {
+                progress::set_length(image.size());
+                let slices = image.compressed_slices(&mut reader, MAX_SLICE_SIZE);
+                session.send_lz4_slices(self.pit_entry, slices).await
+            }
+            Some(header) => {
+                progress::set_length(header.content_size);
+                let slices = image.decompressed_slices(&mut reader, MAX_SLICE_SIZE);
+                session.send_slices(self.pit_entry, slices).await
+            }
+        }
+    }
+}
+
 /// A blueprint resolved against a PIT.
 #[derive(Default)]
 struct Resolved<'p> {
@@ -720,13 +763,7 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashBl
                 size: partition_size,
             });
 
-            let res = async {
-                let mut reader = planned.image.open(&mut self.readers).await?;
-                session.send_partition(&planned, &mut reader).await
-            }
-            .await;
-
-            if let Err(e) = res {
+            if let Err(e) = planned.send(session, &mut self.readers).await {
                 progress::on_event(FlashEvent::PartitionFail(&name));
                 return Err(FlashError::Odin(e));
             }

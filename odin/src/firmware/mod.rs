@@ -21,7 +21,7 @@ mod lz4;
 mod package;
 mod tar;
 
-pub(crate) use image::{FirmwareImage, FirmwarePartitionPayload, FirmwareReaders, ImageSource};
+pub(crate) use image::{FirmwareImage, FirmwareReaders, ImageSource};
 #[cfg(test)]
 pub(crate) use lz4::Lz4FrameHeader;
 pub use package::verify_md5_footer;

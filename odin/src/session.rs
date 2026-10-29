@@ -17,12 +17,10 @@
 
 use crate::device_info::{DeviceInfo, SessionDeviceInfo};
 use crate::error::{LokeError, OdinError};
-use crate::firmware::FirmwarePartitionPayload;
 use crate::progress;
 use crate::protocol::{CMD_PIT, Command, DataChunk, Response, STREAMING_CHUNK_ACK};
 use crate::usb::UsbTransfer;
 use futures::StreamExt;
-use futures::io::AsyncRead;
 use futures::stream::Stream;
 use samloader_pit::PitEntry;
 use std::time::Duration;
@@ -37,7 +35,11 @@ pub struct OdinConnection {
     skip_empty_send: bool,
 }
 
-const MAX_SLICE_SIZE: usize = 30 * 1024 * 1024; // 30 MB (0x1E00000) staging limit in odin4
+/// Maximum size of a slice, which the bootloader stages in memory before
+/// committing it (30 MiB, 0x1E00000, as in odin4).
+pub(crate) const MAX_SLICE_SIZE: usize = 30 * 1024 * 1024;
+/// The only LZ4 block size the bootloader accepts compressed slices with.
+const LZ4_PASSTHROUGH_BLOCK_SIZE: u64 = 1024 * 1024;
 const PACKET_SIZE_DEFAULT: usize = 0x20000; // 128 KB default before negotiation
 const SLICE_TIMEOUT_DEFAULT: u32 = 30000;
 
@@ -504,7 +506,9 @@ impl OdinSession {
         Ok(erased_sectors)
     }
 
-    /// Returns whether the negotiated device session supports flashing LZ4-compressed streams.
+    /// Returns whether the device reported support for LZ4-compressed slices
+    /// when the session began. Compressed slices are only accepted with 1 MiB
+    /// blocks; other LZ4 frames must be decompressed before sending.
     pub fn is_lz4_supported(&self) -> bool {
         self.lz4_supported
     }
@@ -514,10 +518,17 @@ impl OdinSession {
         self.bootloader_protocol_version
     }
 
-    async fn transmit_slices<S, Bytes>(
+    /// Returns whether the device accepts LZ4 frames with the given maximum
+    /// block size without decompressing them first.
+    pub(crate) fn accepts_lz4_blocks(&self, block_max_size: u64) -> bool {
+        self.lz4_supported && block_max_size == LZ4_PASSTHROUGH_BLOCK_SIZE
+    }
+
+    /// Transmits a partition image as a stream of raw slices.
+    pub(crate) async fn send_slices<S, Bytes>(
         &mut self,
-        slices: S,
         pit_entry: &PitEntry,
+        slices: S,
     ) -> Result<(), OdinError>
     where
         Bytes: AsRef<[u8]>,
@@ -546,31 +557,19 @@ impl OdinSession {
         Ok(())
     }
 
-    /// Flashes a planned partition payload to the device, streaming LZ4 blocks directly
-    /// when supported by the bootloader or decompressing on the fly when needed.
-    pub(crate) async fn send_partition<R: AsyncRead + Unpin>(
+    /// Transmits a partition image as a stream of LZ4-compressed slices, each
+    /// paired with its decompressed size.
+    ///
+    /// Only valid if [`accepts_lz4_blocks`](Self::accepts_lz4_blocks) holds
+    /// for the frame the slices come from.
+    pub(crate) async fn send_lz4_slices<S>(
         &mut self,
-        part: &FirmwarePartitionPayload<'_>,
-        reader: &mut R,
-    ) -> Result<(), OdinError> {
-        let pit_entry = part.pit_entry;
-        let image = &part.image;
-        let Some(header) = &image.lz4_header else {
-            progress::set_length(image.size());
-            let slices = image.slices(reader, MAX_SLICE_SIZE);
-            return self.transmit_slices(slices, pit_entry).await;
-        };
-
-        if !self.lz4_supported || header.block_max_size != 1024 * 1024 {
-            progress::set_length(header.content_size);
-            let slices = image.decompressed_slices(reader, MAX_SLICE_SIZE);
-            return self.transmit_slices(slices, pit_entry).await;
-        }
-
-        progress::set_length(image.size());
-
-        let slices = image.compressed_slices(reader, MAX_SLICE_SIZE);
-
+        pit_entry: &PitEntry,
+        slices: S,
+    ) -> Result<(), OdinError>
+    where
+        S: Stream<Item = std::io::Result<(usize, Vec<u8>)>>,
+    {
         let mut slices = std::pin::pin!(slices.peekable());
         while let Some(slice_res) = slices.next().await {
             let (decompressed_size, slice_data) = slice_res?;
@@ -730,7 +729,7 @@ mod tests {
             let seq2 = vec![0xBBu8; 0x20000];
             let slices = futures::stream::iter(vec![Ok(seq1.clone()), Ok(seq2)]);
 
-            assert!(session.transmit_slices(slices, &pit_entry).await.is_ok());
+            assert!(session.send_slices(&pit_entry, slices).await.is_ok());
 
             // Verify a mid-stream I/O error aborts the transfer with OdinError::Io
             let failing_slices = futures::stream::iter(vec![
@@ -738,7 +737,7 @@ mod tests {
                 Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
             ]);
             assert!(matches!(
-                session.transmit_slices(failing_slices, &pit_entry).await,
+                session.send_slices(&pit_entry, failing_slices).await,
                 Err(OdinError::Io(_))
             ));
 

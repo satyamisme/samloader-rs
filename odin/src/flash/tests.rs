@@ -705,6 +705,61 @@ fn test_execute_vbmeta_payload_flags() {
 }
 
 #[test]
+fn test_execute_decompresses_lz4_the_device_cannot_take() {
+    use crate::usb::DeviceProfile;
+    use lz4_flex::frame::{BlockMode, BlockSize, FrameEncoder, FrameInfo};
+    use std::io::Write;
+
+    // Spans several 64 KiB blocks
+    let image: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    let (lz4_1mb, _) = lz4_compress(&image);
+    let mut encoder = FrameEncoder::with_frame_info(
+        FrameInfo::new()
+            .content_size(Some(image.len() as u64))
+            .block_size(BlockSize::Max64KB)
+            .block_mode(BlockMode::Independent),
+        Vec::new(),
+    );
+    encoder.write_all(&image).unwrap();
+    let lz4_64kb = encoder.finish().unwrap();
+
+    let flash = |profile: DeviceProfile, lz4_image: &[u8]| {
+        let tar_bytes = build_tar(&[("boot.img.lz4", lz4_image)]);
+        futures::executor::block_on(async {
+            let backend = MockBackend::with_profile(profile);
+            let events = backend.event_log();
+            let mut session = mock_session(backend).await;
+
+            FlashConfig::new()
+                .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
+                .run(&mut session)
+                .await
+                .unwrap();
+
+            let logged = events.lock().unwrap().clone();
+            let slices: Vec<_> = logged
+                .into_iter()
+                .filter_map(|e| match e {
+                    MockEvent::Slice { lz4, data, .. } => Some((lz4, data)),
+                    _ => None,
+                })
+                .collect();
+            assert!(!slices.is_empty());
+            assert!(slices.iter().all(|(lz4, _)| !lz4), "slices must be raw");
+            slices
+                .into_iter()
+                .flat_map(|(_, data)| data)
+                .collect::<Vec<u8>>()
+        })
+    };
+
+    // A device without LZ4 support
+    assert_eq!(flash(DeviceProfile::gt_i9305(), &lz4_1mb), image);
+    // An LZ4 capable device given blocks other than 1 MiB
+    assert_eq!(flash(DeviceProfile::sm_f968b(), &lz4_64kb), image);
+}
+
+#[test]
 fn test_execute_with_local_pit_reports_once() {
     #[derive(Clone, Default)]
     struct Collector(std::sync::Arc<std::sync::Mutex<Vec<String>>>);

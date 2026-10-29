@@ -19,7 +19,6 @@ use super::lz4::{self, Lz4FrameHeader};
 use futures::StreamExt;
 use futures::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, Cursor};
 use futures::stream::{self, Stream};
-use samloader_pit::PitEntry;
 use std::io::{self, SeekFrom};
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -306,14 +305,6 @@ impl FirmwareImage {
             Ok(data)
         }
     }
-}
-
-/// A partition image resolved to the PIT entry it will be flashed to.
-pub(crate) struct FirmwarePartitionPayload<'a> {
-    /// PIT partition entry associated with this payload.
-    pub(crate) pit_entry: &'a PitEntry,
-    /// The image to flash.
-    pub(crate) image: FirmwareImage,
 }
 
 #[cfg(test)]
