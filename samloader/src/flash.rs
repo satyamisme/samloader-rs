@@ -18,7 +18,7 @@ use crate::PartitionArg;
 use crate::print_error;
 use indicatif::{ProgressBar, ProgressStyle};
 use samloader_odin::{
-    FlashEvent, FlashManager, FlashProgress, OdinConnection, RebootMode, UsbBackendOption,
+    FlashConfig, FlashEvent, FlashProgress, OdinConnection, RebootMode, UsbBackendOption,
     create_backend, flashes_userdata,
     futures::{executor::block_on, io::AllowStdIo},
     package_flash_files, set_progress,
@@ -296,7 +296,7 @@ fn flash(args: FlashArgs) -> Result<(), Box<dyn Error>> {
         connection.init().await?;
         let mut session = connection.begin_session().await?;
 
-        let mut flash_manager = FlashManager::new(&mut session)
+        let mut config = FlashConfig::new()
             .reboot_mode(reboot_mode)
             .skip_size_check(skip_size_check)
             .skip_md5(skip_md5)
@@ -309,10 +309,10 @@ fn flash(args: FlashArgs) -> Result<(), Box<dyn Error>> {
             .sales_code(csc_code.as_deref());
 
         if let Some(buffer) = pit_bytes {
-            flash_manager = flash_manager.pit(buffer);
+            config = config.pit(buffer);
         }
 
-        flash_manager.execute().await?;
+        config.execute(&mut session).await?;
         Ok(())
     })
 }

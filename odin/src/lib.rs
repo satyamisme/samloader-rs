@@ -37,7 +37,7 @@ mod usb;
 pub use device_info::{DeviceInfo, SessionDeviceInfo};
 pub use error::{FlashError, LokeError, OdinError};
 pub use firmware::verify_md5_footer;
-pub use flash::{FlashManager, RebootMode, flashes_userdata, package_flash_files};
+pub use flash::{FlashConfig, RebootMode, flashes_userdata, package_flash_files};
 pub use odin::{OdinConnection, OdinSession, query_device_info, reboot_download};
 pub use progress::{FlashEvent, FlashProgress, clear_progress, set_progress};
 pub use usb::{

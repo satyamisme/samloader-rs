@@ -220,7 +220,7 @@ impl Lz4FrameHeader {
 /// Backing byte source for a planned partition payload.
 ///
 /// Rather than owning or holding a mutable borrow of a reader directly, `Package` and
-/// `Image` store indices into [`FlashManager`](crate::FlashManager)'s `packages` and
+/// `Image` store indices into [`FlashConfig`](crate::FlashConfig)'s `packages` and
 /// `partitions` lists. Multiple planned partitions typically originate from the same
 /// TAR archive, and reading requires `&mut R`, so Rust's borrow rules prevent multiple
 /// [`FirmwarePartitionPayload`] items from simultaneously holding `&mut R` references to
@@ -230,7 +230,7 @@ impl Lz4FrameHeader {
 pub(crate) enum FirmwarePartitionSource {
     /// Entry inside a TAR package archive.
     Package {
-        /// Index into `FlashManager::packages`.
+        /// Index into `FlashConfig::packages`.
         index: usize,
         /// Byte offset where the entry's payload starts within the TAR archive.
         offset: u64,
@@ -239,7 +239,7 @@ pub(crate) enum FirmwarePartitionSource {
     },
     /// Standalone partition image.
     Image {
-        /// Index into `FlashManager::partitions`.
+        /// Index into `FlashConfig::partitions`.
         index: usize,
         /// Total byte length of the standalone partition image.
         size: u64,

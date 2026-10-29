@@ -182,7 +182,7 @@ async fn scan_packages<R: AsyncRead + AsyncSeek + Unpin>(
 /// before connecting to a device.
 ///
 /// Readers are only accessed through absolute seeks, so they can be passed to
-/// [`FlashManager::packages`] afterwards without rewinding.
+/// [`FlashConfig::packages`] afterwards without rewinding.
 pub async fn package_flash_files<R: AsyncRead + AsyncSeek + Unpin>(
     packages: &mut [(String, R)],
 ) -> Result<Vec<String>, FlashError> {
@@ -199,7 +199,7 @@ pub async fn package_flash_files<R: AsyncRead + AsyncSeek + Unpin>(
 ///
 /// Each name is either a file name, such as those returned by
 /// [`package_flash_files`], or a partition name. Directories and `.lz4` suffixes
-/// are stripped. `skip` takes the same targets as [`FlashManager::skip`].
+/// are stripped. `skip` takes the same targets as [`FlashConfig::skip`].
 ///
 /// As the device's PIT is not consulted, this is a name-based check meant for
 /// confirmation prompts before connecting to a device. Partitions given by
@@ -300,10 +300,9 @@ pub enum RebootMode {
     Download,
 }
 
-/// Orchestrates the flashing pipeline, processing package and partition sources
-/// and executing the Loke flash protocol.
-pub struct FlashManager<'a, P = Cursor<&'static [u8]>, I = Cursor<&'static [u8]>> {
-    session: &'a mut OdinSession,
+/// Configures a flash operation, processing package and partition sources and
+/// executing the Loke flash protocol. Building it performs no I/O.
+pub struct FlashConfig<P = Cursor<&'static [u8]>, I = Cursor<&'static [u8]>> {
     pit_file_bytes: Option<Vec<u8>>,
 
     reboot_mode: RebootMode,
@@ -313,17 +312,16 @@ pub struct FlashManager<'a, P = Cursor<&'static [u8]>, I = Cursor<&'static [u8]>
     partitions: Vec<(Option<String>, String, I)>,
     super_used_size: Option<u32>,
     has_download_list: bool,
-    sales_code: Option<&'a str>,
+    sales_code: Option<String>,
     erase: bool,
     skip: Vec<String>,
     vbmeta_flags: u32,
 }
 
-impl<'a> FlashManager<'a> {
-    /// Creates a new `FlashManager` associated with an active `OdinSession`.
-    pub fn new(session: &'a mut OdinSession) -> Self {
+impl FlashConfig {
+    /// Creates a new `FlashConfig` with default options and no inputs.
+    pub fn new() -> Self {
         Self {
-            session,
             pit_file_bytes: None,
             reboot_mode: RebootMode::None,
             skip_size_check: false,
@@ -340,7 +338,13 @@ impl<'a> FlashManager<'a> {
     }
 }
 
-impl<'a, P, I> FlashManager<'a, P, I> {
+impl Default for FlashConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<P, I> FlashConfig<P, I> {
     /// Sets whether to perform a low-level NAND hardware erase on the `USERDATA` partition
     /// prior to flashing or as a standalone wipe operation.
     pub fn erase(mut self, enabled: bool) -> Self {
@@ -349,32 +353,14 @@ impl<'a, P, I> FlashManager<'a, P, I> {
     }
 
     /// Sets an optional 3-letter CSC / Sales Code to configure on the device.
-    pub fn sales_code(mut self, sales_code: Option<&'a str>) -> Self {
-        self.sales_code = sales_code;
+    pub fn sales_code(mut self, sales_code: Option<&str>) -> Self {
+        self.sales_code = sales_code.map(str::to_owned);
         self
     }
 
     /// Sets the reboot mode to perform after flashing completes.
     pub fn reboot_mode(mut self, mode: RebootMode) -> Self {
         self.reboot_mode = mode;
-        self
-    }
-
-    /// Sets whether to automatically reboot normally out of Download Mode after flashing.
-    pub fn auto_reboot(mut self, enabled: bool) -> Self {
-        self.reboot_mode = if enabled {
-            RebootMode::Normal
-        } else {
-            RebootMode::None
-        };
-        self
-    }
-
-    /// Sets whether to reboot the device back into Download Mode after flashing.
-    pub fn redownload(mut self, enabled: bool) -> Self {
-        if enabled {
-            self.reboot_mode = RebootMode::Download;
-        }
         self
     }
 
@@ -400,9 +386,8 @@ impl<'a, P, I> FlashManager<'a, P, I> {
     pub fn packages<S: Into<String>, R>(
         self,
         packages: impl IntoIterator<Item = (S, R)>,
-    ) -> FlashManager<'a, R, I> {
-        FlashManager {
-            session: self.session,
+    ) -> FlashConfig<R, I> {
+        FlashConfig {
             pit_file_bytes: self.pit_file_bytes,
             reboot_mode: self.reboot_mode,
             skip_size_check: self.skip_size_check,
@@ -425,9 +410,8 @@ impl<'a, P, I> FlashManager<'a, P, I> {
     pub fn partitions<S: Into<String>, R>(
         self,
         partitions: impl IntoIterator<Item = (Option<String>, S, R)>,
-    ) -> FlashManager<'a, P, R> {
-        FlashManager {
-            session: self.session,
+    ) -> FlashConfig<P, R> {
+        FlashConfig {
             pit_file_bytes: self.pit_file_bytes,
             reboot_mode: self.reboot_mode,
             skip_size_check: self.skip_size_check,
@@ -484,15 +468,13 @@ impl<'a, P, I> FlashManager<'a, P, I> {
     }
 }
 
-impl<'a, P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin>
-    FlashManager<'a, P, I>
-{
-    /// Executes the flashing pipeline sequence.
-    pub async fn execute(&mut self) -> Result<(), FlashError> {
+impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashConfig<P, I> {
+    /// Executes the flashing pipeline sequence on the device behind `session`.
+    pub async fn execute(&mut self, session: &mut OdinSession) -> Result<(), FlashError> {
         // Step 0: Set device sales code if configured
-        if let Some(sales_code) = self.sales_code {
+        if let Some(sales_code) = &self.sales_code {
             progress::println(&format!("Setting device sales code to {}...", sales_code));
-            self.session.set_sales_code(sales_code).await?;
+            session.set_sales_code(sales_code).await?;
         }
 
         // If no packages, partitions, or explicit PIT are specified, complete session and return
@@ -511,12 +493,12 @@ impl<'a, P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin>
                 );
             }
             if self.erase {
-                self.session.nand_erase().await?;
+                session.nand_erase().await?;
             }
             match self.reboot_mode {
-                RebootMode::Normal => self.session.reboot_device().await?,
-                RebootMode::Download => self.session.reboot_to_download().await?,
-                RebootMode::None => self.session.end_session().await?,
+                RebootMode::Normal => session.reboot_device().await?,
+                RebootMode::Download => session.reboot_to_download().await?,
+                RebootMode::None => session.end_session().await?,
             }
             return Ok(());
         }
@@ -538,24 +520,24 @@ impl<'a, P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin>
             self.plan_partitions(&planning_pit, &entries, false).await?;
 
             if self.erase {
-                self.session.nand_erase().await?;
+                session.nand_erase().await?;
             }
 
             let pit_bytes = self.pit_file_bytes.as_ref().unwrap();
             progress::println("Flashing PIT");
-            self.session.send_pit_info(pit_bytes).await?;
+            session.send_pit_info(pit_bytes).await?;
             progress::println("PIT flash successful\n");
 
-            let downloaded = self.download_pit().await?;
+            let downloaded = Self::download_pit(session).await?;
             let pit_ref = flashed_pit.insert(downloaded);
             self.plan_partitions(pit_ref, &entries, true).await?
         } else {
-            let downloaded = self.download_pit().await?;
+            let downloaded = Self::download_pit(session).await?;
             let pit_ref = flashed_pit.insert(downloaded);
             let planned = self.plan_partitions(pit_ref, &entries, true).await?;
 
             if self.erase {
-                self.session.nand_erase().await?;
+                session.nand_erase().await?;
             }
             planned
         };
@@ -574,7 +556,7 @@ impl<'a, P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin>
         }
 
         // Step 3: Flash payloads to the device
-        self.flash_partitions(planned_partitions, self.reboot_mode)
+        self.flash_partitions(session, planned_partitions, self.reboot_mode)
             .await?;
 
         Ok(())
@@ -620,9 +602,9 @@ impl<'a, P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin>
     }
 
     // Helper 4: Download active PIT data from device
-    async fn download_pit(&mut self) -> Result<PitData, FlashError> {
+    async fn download_pit(session: &mut OdinSession) -> Result<PitData, FlashError> {
         progress::println("Downloading device's PIT file");
-        let pit_buffer = self.session.receive_pit_info().await?;
+        let pit_buffer = session.receive_pit_info().await?;
         let pit_data = PitData::new(&pit_buffer).map_err(FlashError::PitUnpackFailed)?;
         Ok(pit_data)
     }
@@ -910,6 +892,7 @@ impl<'a, P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin>
     // Helper 9: Flash deduplicated partition payloads to the device
     async fn flash_partitions(
         &mut self,
+        session: &mut OdinSession,
         planned_partitions: Vec<FirmwarePartitionPayload<'_>>,
         reboot_mode: RebootMode,
     ) -> Result<(), FlashError> {
@@ -918,11 +901,11 @@ impl<'a, P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin>
             .map(FirmwarePartitionPayload::uncompressed_size)
             .sum();
 
-        self.session.set_total_bytes(total_bytes).await?;
+        session.set_total_bytes(total_bytes).await?;
 
         if let Some(super_used_size) = self.super_used_size
             && super_used_size > 0
-            && self.session.bootloader_protocol_version() >= 3
+            && session.bootloader_protocol_version() >= 3
         {
             let check_size = if self.has_download_list || self.packages.is_empty() {
                 super_used_size
@@ -930,7 +913,7 @@ impl<'a, P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin>
                 0
             };
             progress::println("Checking available super partition size...");
-            self.session
+            session
                 .check_super_size(check_size)
                 .await
                 .map_err(FlashError::SuperSizeCheckFailed)?;
@@ -950,7 +933,7 @@ impl<'a, P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin>
                     .source
                     .open_reader(&mut self.packages, &mut self.partitions)
                     .await?;
-                self.session.send_partition(&planned, &mut reader).await
+                session.send_partition(&planned, &mut reader).await
             }
             .await;
 
@@ -962,14 +945,14 @@ impl<'a, P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin>
             progress::on_event(FlashEvent::PartitionEnd(&name));
         }
 
-        self.session.end_session().await?;
+        session.end_session().await?;
 
         match reboot_mode {
             RebootMode::Normal => {
-                self.session.reboot_device().await?;
+                session.reboot_device().await?;
             }
             RebootMode::Download => {
-                self.session.reboot_to_download().await?;
+                session.reboot_to_download().await?;
             }
             RebootMode::None => {}
         }
@@ -1029,12 +1012,7 @@ mod tests {
         ]);
 
         futures::executor::block_on(async {
-            let backend = Box::new(MockBackend::new());
-            let mut connection = OdinConnection::new(backend);
-            connection.init().await.unwrap();
-            let mut session = connection.begin_session().await.unwrap();
-
-            let mut manager = FlashManager::new(&mut session)
+            let mut manager = FlashConfig::new()
                 .packages([("test_package.tar", Cursor::new(tar_bytes.as_slice()))]);
             let resolved = manager.scan_tar_packages().await.unwrap();
 
@@ -1053,13 +1031,13 @@ mod tests {
             connection.init().await.unwrap();
             let mut session = connection.begin_session().await.unwrap();
 
-            let mut manager = FlashManager::new(&mut session);
+            let mut manager = FlashConfig::new();
             manager.super_used_size = Some(27276104);
             manager.has_download_list = true;
 
             assert!(
                 manager
-                    .flash_partitions(Vec::new(), RebootMode::None)
+                    .flash_partitions(&mut session, Vec::new(), RebootMode::None)
                     .await
                     .is_ok()
             );
@@ -1078,11 +1056,13 @@ mod tests {
             connection.init().await.unwrap();
             let mut session = connection.begin_session().await.unwrap();
 
-            let mut manager = FlashManager::new(&mut session);
+            let mut manager = FlashConfig::new();
             manager.super_used_size = Some(27276104);
             manager.has_download_list = true;
 
-            let res = manager.flash_partitions(Vec::new(), RebootMode::None).await;
+            let res = manager
+                .flash_partitions(&mut session, Vec::new(), RebootMode::None)
+                .await;
             assert!(matches!(res, Err(FlashError::SuperSizeCheckFailed(_))));
         });
     }
@@ -1100,13 +1080,13 @@ mod tests {
             connection.init().await.unwrap();
             let mut session = connection.begin_session().await.unwrap();
 
-            let mut manager = FlashManager::new(&mut session);
+            let mut manager = FlashConfig::new();
             manager.super_used_size = Some(27276104);
             manager.has_download_list = true;
 
             assert!(
                 manager
-                    .flash_partitions(Vec::new(), RebootMode::None)
+                    .flash_partitions(&mut session, Vec::new(), RebootMode::None)
                     .await
                     .is_ok()
             );
@@ -1118,12 +1098,7 @@ mod tests {
         let tar_bytes = build_tar(&[("meta-data/download-list.txt", &[0xFF, 0xFE, 0xFD])]);
 
         futures::executor::block_on(async {
-            let backend = Box::new(MockBackend::new());
-            let mut connection = OdinConnection::new(backend);
-            connection.init().await.unwrap();
-            let mut session = connection.begin_session().await.unwrap();
-
-            let mut manager = FlashManager::new(&mut session)
+            let mut manager = FlashConfig::new()
                 .packages([("corrupt_manifest.tar", Cursor::new(tar_bytes.as_slice()))]);
             let result = manager.scan_tar_packages().await;
 
@@ -1143,13 +1118,15 @@ mod tests {
                 env!("CARGO_MANIFEST_DIR"),
                 "/test-data/M3_EUR_OPEN_4G.pit"
             ));
-            let mut manager = FlashManager::new(&mut session).pit(&pit_bytes[..]);
+            let config = FlashConfig::new().pit(&pit_bytes[..]);
 
-            let local_pit = manager.parse_local_pit().unwrap();
+            let local_pit = config.parse_local_pit().unwrap();
             assert_eq!(local_pit.cpu_bl_id.to_string_lossy(), "Mx-MDM");
 
-            manager.session.send_pit_info(pit_bytes).await.unwrap();
-            let pit_data = manager.download_pit().await.unwrap();
+            session.send_pit_info(pit_bytes).await.unwrap();
+            let pit_data = FlashConfig::<Cursor<&[u8]>>::download_pit(&mut session)
+                .await
+                .unwrap();
             // M3_EUR_OPEN_4G.pit has Mx-MDM, verifying PIT was sent and updated device state
             assert_eq!(pit_data.cpu_bl_id.to_string_lossy(), "Mx-MDM");
         });
@@ -1166,12 +1143,7 @@ mod tests {
     fn skipped_names(targets: &[&str]) -> Result<Vec<String>, FlashError> {
         futures::executor::block_on(async {
             let pit_data = ab_pit_data();
-            let backend = Box::new(MockBackend::new());
-            let mut connection = OdinConnection::new(backend);
-            connection.init().await.unwrap();
-            let mut session = connection.begin_session().await.unwrap();
-
-            let manager = FlashManager::new(&mut session).skip(targets);
+            let manager = FlashConfig::new().skip(targets);
             let skipped_ids = manager.resolve_skipped_partitions(&pit_data)?;
             let mut names: Vec<String> = pit_data
                 .entries
@@ -1231,12 +1203,7 @@ mod tests {
 
         futures::executor::block_on(async {
             let pit_data = ab_pit_data();
-            let backend = Box::new(MockBackend::new());
-            let mut connection = OdinConnection::new(backend);
-            connection.init().await.unwrap();
-            let mut session = connection.begin_session().await.unwrap();
-
-            let mut manager = FlashManager::new(&mut session)
+            let mut manager = FlashConfig::new()
                 .partitions(partitions)
                 .skip(&["boot.img", "VBMETA"]);
             let skipped_ids = manager.resolve_skipped_partitions(&pit_data).unwrap();
@@ -1272,10 +1239,10 @@ mod tests {
                 let mut connection = OdinConnection::new(backend);
                 connection.init().await.unwrap();
                 let mut session = connection.begin_session().await.unwrap();
-                FlashManager::new(&mut session)
+                FlashConfig::new()
                     .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
                     .skip(skip)
-                    .execute()
+                    .execute(&mut session)
                     .await
             })
         };
@@ -1313,12 +1280,7 @@ mod tests {
         verification: bool,
     ) -> Result<(), FlashError> {
         futures::executor::block_on(async {
-            let backend = Box::new(MockBackend::new());
-            let mut connection = OdinConnection::new(backend);
-            connection.init().await.unwrap();
-            let mut session = connection.begin_session().await.unwrap();
-
-            FlashManager::new(&mut session)
+            FlashConfig::new()
                 .partitions(partitions.into_iter().map(|r| (None, "part", r)))
                 .disable_verity(verity)
                 .disable_verification(verification)
@@ -1532,10 +1494,10 @@ mod tests {
                 connection.init().await.unwrap();
                 let mut session = connection.begin_session().await.unwrap();
                 assert!(session.is_lz4_supported());
-                FlashManager::new(&mut session)
+                FlashConfig::new()
                     .packages([(name, Cursor::new(tar_bytes))])
                     .disable_verity(verity)
-                    .execute()
+                    .execute(&mut session)
                     .await
             })
         };
@@ -1562,10 +1524,10 @@ mod tests {
             connection.init().await.unwrap();
             let mut session = connection.begin_session().await.unwrap();
 
-            let res = FlashManager::new(&mut session)
+            let res = FlashConfig::new()
                 .erase(true)
                 .packages([("AP.tar", Cursor::new(truncated))])
-                .execute()
+                .execute(&mut session)
                 .await;
 
             assert!(matches!(res, Err(FlashError::ArchiveCorrupted(pkg, _)) if pkg == "AP.tar"));
@@ -1591,11 +1553,11 @@ mod tests {
             connection.init().await.unwrap();
             let mut session = connection.begin_session().await.unwrap();
 
-            let res = FlashManager::new(&mut session)
+            let res = FlashConfig::new()
                 .erase(true)
                 .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
                 .skip(&["nonexistent_partition"])
-                .execute()
+                .execute(&mut session)
                 .await;
 
             assert!(
@@ -1625,12 +1587,12 @@ mod tests {
             connection.init().await.unwrap();
             let mut session = connection.begin_session().await.unwrap();
 
-            let res = FlashManager::new(&mut session)
+            let res = FlashConfig::new()
                 .pit(&pit_bytes[..])
                 .erase(true)
                 .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
                 .disable_verity(true)
-                .execute()
+                .execute(&mut session)
                 .await;
 
             assert!(
@@ -1660,11 +1622,11 @@ mod tests {
             connection.init().await.unwrap();
             let mut session = connection.begin_session().await.unwrap();
 
-            FlashManager::new(&mut session)
+            FlashConfig::new()
                 .pit(&pit_bytes[..])
                 .erase(true)
                 .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
-                .execute()
+                .execute(&mut session)
                 .await
                 .unwrap();
 
@@ -1688,10 +1650,10 @@ mod tests {
             connection.init().await.unwrap();
             let mut session = connection.begin_session().await.unwrap();
 
-            FlashManager::new(&mut session)
+            FlashConfig::new()
                 .erase(true)
                 .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
-                .execute()
+                .execute(&mut session)
                 .await
                 .unwrap();
 
@@ -1714,11 +1676,11 @@ mod tests {
             connection.init().await.unwrap();
             let mut session = connection.begin_session().await.unwrap();
 
-            let res = FlashManager::new(&mut session)
+            let res = FlashConfig::new()
                 .pit(b"invalid_pit_bytes")
                 .erase(true)
                 .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
-                .execute()
+                .execute(&mut session)
                 .await;
 
             assert!(matches!(res, Err(FlashError::PitUnpackFailed(_))));
@@ -1756,11 +1718,11 @@ mod tests {
             connection.init().await.unwrap();
             let mut session = connection.begin_session().await.unwrap();
 
-            FlashManager::new(&mut session)
+            FlashConfig::new()
                 .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
                 .disable_verity(true)
                 .disable_verification(true)
-                .execute()
+                .execute(&mut session)
                 .await
                 .unwrap();
 
@@ -1789,9 +1751,9 @@ mod tests {
             connection.init().await.unwrap();
             let mut session = connection.begin_session().await.unwrap();
 
-            FlashManager::new(&mut session)
+            FlashConfig::new()
                 .packages([("AP.tar", Cursor::new(raw_tar.as_slice()))])
-                .execute()
+                .execute(&mut session)
                 .await
                 .unwrap();
 
@@ -1816,9 +1778,9 @@ mod tests {
             connection.init().await.unwrap();
             let mut session = connection.begin_session().await.unwrap();
 
-            FlashManager::new(&mut session)
+            FlashConfig::new()
                 .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
-                .execute()
+                .execute(&mut session)
                 .await
                 .unwrap();
 
@@ -1900,11 +1862,11 @@ mod tests {
 
             // The plan is checked against the local PIT and then rebuilt against the
             // flashed PIT, but informational messages must only be printed once
-            FlashManager::new(&mut session)
+            FlashConfig::new()
                 .pit(&pit_bytes[..])
                 .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
                 .skip(&["DTBO"])
-                .execute()
+                .execute(&mut session)
                 .await
         });
         crate::progress::clear_progress();
