@@ -13,10 +13,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::*;
+use super::USB_CLASS_CDC_DATA;
+use super::{UsbBackend, UsbTransfer};
+use crate::compat::MaybeSend;
+use crate::error::OdinError;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use ::nusb::transfer::{Buffer, BulkOrInterrupt, Completion, EndpointDirection};
 use futures_timer::Delay;

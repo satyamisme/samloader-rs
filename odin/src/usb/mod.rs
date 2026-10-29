@@ -16,24 +16,16 @@
 #[cfg(not(any(real_backend, mock_backend)))]
 compile_error!("At least one USB backend must be enabled!");
 
-use crate::compat::MaybeSend;
 use crate::error::OdinError;
 use std::time::Duration;
 
-#[cfg(feature = "rusb")]
-use ::rusb::{Context, DeviceHandle, UsbContext};
-
-#[cfg(feature = "serialport")]
-use std::io::{Read, Write};
-
-#[allow(unused_macros)]
+#[cfg_attr(not(real_backend), allow(unused_macros))]
 macro_rules! print_warning {
     ($($arg:tt)*) => {
         crate::progress::eprintln_verbose(&format!("WARNING: {}", format_args!($($arg)*)));
     };
 }
 
-#[allow(unused_macros)]
 macro_rules! print_verbose {
     ($($arg:tt)*) => {
         crate::progress::eprintln_verbose(&format!($($arg)*));
@@ -50,9 +42,6 @@ const SUPPORTED_DEVICES: &[(u16, u16)] = &[
     (VID_SAMSUNG, PID_GALAXY_S2),
     (VID_SAMSUNG, PID_DROID_CHARGE),
 ];
-
-#[cfg(any(feature = "nusb", feature = "rusb"))]
-const USB_CLASS_CDC_DATA: u8 = 0x0A;
 
 /// Returns whether the VID/PID belongs to a Samsung device that is not in Download Mode.
 fn is_normal_mode_device(vid: u16, pid: u16) -> bool {
@@ -116,6 +105,11 @@ where
     }
 }
 
+/// Opens the first device in Download Mode.
+async fn open_download_device<B: UsbBackend>() -> Result<B, OdinError> {
+    B::new(B::find_download_device().await?).await
+}
+
 /// Opens the first usable Samsung device that is not in Download Mode.
 async fn open_normal_mode_device<B: UsbBackend>() -> Result<B, OdinError> {
     match open_first_usable(is_normal_mode_device).await {
@@ -124,41 +118,13 @@ async fn open_normal_mode_device<B: UsbBackend>() -> Result<B, OdinError> {
     }
 }
 
-/// Trait representing a duplex data transport layer for USB or serial communication.
-#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
-#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
-pub trait UsbTransfer: MaybeSend {
-    /// Resets the transport connection state and buffers.
-    async fn reset(&mut self);
-    /// Sends a buffer of data across the transport with a timeout.
-    async fn send_data(&mut self, data: &[u8], timeout: i32) -> bool;
-    /// Receives data from the transport into a buffer, returning the number of bytes read.
-    async fn receive_data(&mut self, data: &mut [u8], timeout: i32) -> i32;
-    /// Returns the USB Product descriptor string if available.
-    fn product_name(&self) -> Option<&str> {
-        None
-    }
-}
+mod backend;
+mod transport;
 
-/// Trait representing a backend factory and device locator for USB or serial transports.
-#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
-#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
-pub trait UsbBackend: Sized + UsbTransfer {
-    /// The associated device type identifier.
-    type UsbDevice: MaybeSend;
-
-    /// Instantiates a new backend session wrapper for a given device.
-    async fn new(device: Self::UsbDevice) -> Result<Self, OdinError>;
-    /// Searches for a matching connected device based on a predicate.
-    async fn find_device<'a, F>(predicate: F) -> Result<Self::UsbDevice, OdinError>
-    where
-        F: FnMut(u16, u16) -> bool + MaybeSend + 'a;
-
-    /// Searches for a connected device in Download Mode.
-    async fn find_download_device() -> Result<Self::UsbDevice, OdinError> {
-        Self::find_device(|vid, pid| SUPPORTED_DEVICES.contains(&(vid, pid))).await
-    }
-}
+pub use backend::UsbBackendOption;
+#[cfg(any(feature = "nusb", feature = "rusb"))]
+pub(crate) use transport::USB_CLASS_CDC_DATA;
+pub use transport::{UsbBackend, UsbTransfer};
 
 #[cfg(feature = "rusb")]
 pub use rusb::RusbBackend;
@@ -184,166 +150,6 @@ pub use mock::{DeviceProfile, DeviceProfileBuilder, MockBackend, MockEvent};
 
 #[cfg(mock_backend)]
 mod mock;
-
-/// Supported USB backend options.
-#[derive(Debug, Clone, Copy)]
-pub enum UsbBackendOption {
-    /// libusb (rusb) backend.
-    #[cfg(feature = "rusb")]
-    Libusb,
-    /// Virtual COM port (serialport) backend.
-    #[cfg(feature = "serialport")]
-    Vcom,
-    /// nusb backend.
-    #[cfg(feature = "nusb")]
-    Nusb,
-    /// Mock backend.
-    #[cfg(mock_backend)]
-    Mock,
-}
-
-impl TryFrom<&str> for UsbBackendOption {
-    type Error = OdinError;
-
-    fn try_from(s: &str) -> Result<Self, Self::Error> {
-        match s {
-            #[cfg(feature = "rusb")]
-            "libusb" => Ok(UsbBackendOption::Libusb),
-            #[cfg(feature = "serialport")]
-            "vcom" => Ok(UsbBackendOption::Vcom),
-            #[cfg(feature = "nusb")]
-            "nusb" => Ok(UsbBackendOption::Nusb),
-            #[cfg(mock_backend)]
-            "mock" => Ok(UsbBackendOption::Mock),
-            _ => Err(OdinError::ParseError(format!("Unknown USB backend: {s}"))),
-        }
-    }
-}
-
-impl std::str::FromStr for UsbBackendOption {
-    type Err = OdinError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::try_from(s)
-    }
-}
-
-impl UsbBackendOption {
-    /// All backend options enabled in this build, in order of preference.
-    pub const ALL: &'static [UsbBackendOption] = &[
-        #[cfg(feature = "nusb")]
-        UsbBackendOption::Nusb,
-        #[cfg(feature = "rusb")]
-        UsbBackendOption::Libusb,
-        #[cfg(feature = "serialport")]
-        UsbBackendOption::Vcom,
-        #[cfg(mock_backend)]
-        UsbBackendOption::Mock,
-    ];
-
-    /// Returns the string representation of the backend option.
-    pub const fn to_str(self) -> &'static str {
-        match self {
-            #[cfg(feature = "rusb")]
-            UsbBackendOption::Libusb => "libusb",
-            #[cfg(feature = "serialport")]
-            UsbBackendOption::Vcom => "vcom",
-            #[cfg(feature = "nusb")]
-            UsbBackendOption::Nusb => "nusb",
-            #[cfg(mock_backend)]
-            UsbBackendOption::Mock => "mock",
-        }
-    }
-
-    pub(crate) async fn check_device(self) -> Result<(), OdinError> {
-        match self {
-            #[cfg(feature = "serialport")]
-            UsbBackendOption::Vcom => {
-                SerialBackend::find_download_device().await?;
-                Ok(())
-            }
-            #[cfg(feature = "nusb")]
-            UsbBackendOption::Nusb => {
-                NusbBackend::find_download_device().await?;
-                Ok(())
-            }
-            #[cfg(feature = "rusb")]
-            UsbBackendOption::Libusb => {
-                RusbBackend::find_download_device().await?;
-                Ok(())
-            }
-            #[cfg(mock_backend)]
-            UsbBackendOption::Mock => {
-                MockBackend::find_download_device().await?;
-                Ok(())
-            }
-        }
-    }
-
-    async fn create_transfer(self) -> Result<Box<dyn UsbTransfer>, OdinError> {
-        match self {
-            #[cfg(feature = "serialport")]
-            UsbBackendOption::Vcom => {
-                let device = SerialBackend::find_download_device().await?;
-                let backend = SerialBackend::new(device).await?;
-                Ok(Box::new(backend))
-            }
-            #[cfg(feature = "nusb")]
-            UsbBackendOption::Nusb => {
-                let device = NusbBackend::find_download_device().await?;
-                let backend = NusbBackend::new(device).await?;
-                Ok(Box::new(backend))
-            }
-            #[cfg(feature = "rusb")]
-            UsbBackendOption::Libusb => {
-                let device = RusbBackend::find_download_device().await?;
-                let backend = RusbBackend::new(device).await?;
-                Ok(Box::new(backend))
-            }
-            #[cfg(mock_backend)]
-            UsbBackendOption::Mock => {
-                MockBackend::find_download_device().await?;
-                let backend = <MockBackend as UsbBackend>::new(()).await?;
-                Ok(Box::new(backend))
-            }
-        }
-    }
-
-    /// Opens a Samsung device that is not in Download Mode, skipping devices
-    /// that do not expose a usable interface.
-    pub(crate) async fn create_normal_mode_transfer(
-        self,
-    ) -> Result<Box<dyn UsbTransfer>, OdinError> {
-        match self {
-            #[cfg(feature = "serialport")]
-            UsbBackendOption::Vcom => {
-                let backend: SerialBackend = open_normal_mode_device().await?;
-                Ok(Box::new(backend))
-            }
-            #[cfg(feature = "nusb")]
-            UsbBackendOption::Nusb => {
-                let backend: NusbBackend = open_normal_mode_device().await?;
-                Ok(Box::new(backend))
-            }
-            #[cfg(feature = "rusb")]
-            UsbBackendOption::Libusb => {
-                let backend: RusbBackend = open_normal_mode_device().await?;
-                Ok(Box::new(backend))
-            }
-            #[cfg(mock_backend)]
-            UsbBackendOption::Mock => {
-                let backend: MockBackend = open_normal_mode_device().await?;
-                Ok(Box::new(backend))
-            }
-        }
-    }
-}
-
-impl std::fmt::Display for UsbBackendOption {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.to_str())
-    }
-}
 
 async fn poll_device<T, F, Fut>(wait: bool, mut f: F) -> Result<T, OdinError>
 where
@@ -433,6 +239,7 @@ pub async fn request_reboot_device(usb_backend: UsbBackendOption) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compat::MaybeSend;
     use std::cell::RefCell;
 
     const PID_NORMAL: u16 = 0x6860;
@@ -487,15 +294,6 @@ mod tests {
             DEVICES
                 .with_borrow(|d| d.iter().copied().find(|&(vid, pid, _)| predicate(vid, pid)))
                 .ok_or(OdinError::DeviceNotFound)
-        }
-    }
-
-    #[test]
-    fn test_all_backends_round_trip() {
-        assert!(!UsbBackendOption::ALL.is_empty());
-        for backend in UsbBackendOption::ALL {
-            let parsed = UsbBackendOption::try_from(backend.to_str()).unwrap();
-            assert_eq!(parsed.to_str(), backend.to_str());
         }
     }
 

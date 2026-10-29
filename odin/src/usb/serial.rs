@@ -13,7 +13,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::*;
+use super::{UsbBackend, UsbTransfer};
+use crate::compat::MaybeSend;
+use crate::error::OdinError;
+use std::io::{Read, Write};
+use std::time::Duration;
 
 /// Serial VCOM communication backend using virtual serial ports.
 pub struct SerialBackend {

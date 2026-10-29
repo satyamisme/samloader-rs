@@ -13,7 +13,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::*;
+use super::USB_CLASS_CDC_DATA;
+use super::{UsbBackend, UsbTransfer};
+use crate::compat::MaybeSend;
+use crate::error::OdinError;
+use ::rusb::{Context, DeviceHandle, UsbContext};
+use std::time::Duration;
 
 /// USB communication backend using `libusb` / `rusb`.
 pub struct RusbBackend {
