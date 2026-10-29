@@ -43,6 +43,11 @@ pub enum FlashEvent<'a> {
 
 /// A trait for reporting partition flash/upload progress and status messages.
 ///
+/// Besides progress and lifecycle events, reporters also receive the crate's log
+/// and diagnostic messages. This is deliberate: frontends such as a web app can
+/// show them in their own UI, which the `log` crate makes difficult on WASM as
+/// its loggers must be `Send + Sync` and cannot hold JavaScript callbacks.
+///
 /// Implementations must be `Send + Sync` on non-WASM targets. On WASM, these
 /// bounds are lifted so implementations can hold JavaScript values.
 pub trait FlashProgress: MaybeSend + MaybeSync {
@@ -90,7 +95,10 @@ thread_local! {
 
 /// Sets the global progress reporter.
 ///
-/// On WASM, the reporter is only active on the calling thread.
+/// The reporter is global rather than passed to each operation, so progress can be
+/// reported from anywhere in the crate, down to individual USB transfers. This
+/// assumes a single flash at a time per process. On WASM, the reporter is only
+/// active on the calling thread, allowing one flash per thread.
 pub fn set_progress(progress: impl FlashProgress + 'static) {
     replace_progress(Some(Box::new(progress)));
 }
