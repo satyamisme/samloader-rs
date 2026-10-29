@@ -313,6 +313,7 @@ pub async fn verify_md5_footer<R: AsyncRead + AsyncSeek + Unpin>(
 }
 
 /// Header containing metadata parsed from an LZ4 frame.
+#[derive(Clone, Debug)]
 pub(crate) struct Lz4FrameHeader {
     /// Total size of the decompressed content in bytes.
     pub(crate) content_size: u64,
@@ -411,6 +412,7 @@ impl Lz4FrameHeader {
 /// the same underlying archive reader. Storing the index allows
 /// [`FirmwarePartitionSource::open_reader`] to borrow and seek the appropriate reader on
 /// demand one partition at a time.
+#[derive(Clone)]
 pub(crate) enum FirmwarePartitionSource {
     /// Entry inside a TAR package archive.
     Package {
@@ -488,17 +490,45 @@ impl<P: AsyncRead + Unpin, I: AsyncRead + Unpin> AsyncRead for SourceReader<'_, 
     }
 }
 
-/// A resolved partition payload ready to be inspected or flashed to the device.
+/// A partition image resolved to the PIT entry it will be flashed to.
 pub(crate) struct FirmwarePartitionPayload<'a> {
     /// PIT partition entry associated with this payload.
     pub(crate) pit_entry: &'a PitEntry,
-    /// Backing source for the payload bytes.
+    /// The image to flash.
+    pub(crate) image: FirmwareImage,
+}
+
+/// The bytes of a partition image and how they are encoded, independent of any PIT.
+#[derive(Clone)]
+pub(crate) struct FirmwareImage {
+    /// Backing source for the image bytes.
     pub(crate) source: FirmwarePartitionSource,
-    /// Metadata header of the LZ4 frame if the payload is LZ4-compressed.
+    /// Metadata header of the LZ4 frame if the image is LZ4-compressed.
     pub(crate) lz4_header: Option<Lz4FrameHeader>,
 }
 
-impl<'a> FirmwarePartitionPayload<'a> {
+impl FirmwareImage {
+    /// Inspects the image stored in `source`, parsing its LZ4 frame header if
+    /// `is_lz4` is set.
+    pub(crate) async fn inspect<P, I>(
+        source: FirmwarePartitionSource,
+        is_lz4: bool,
+        packages: &mut [(String, P)],
+        partitions: &mut [(Option<String>, String, I)],
+    ) -> io::Result<Self>
+    where
+        P: AsyncRead + AsyncSeek + Unpin,
+        I: AsyncRead + AsyncSeek + Unpin,
+    {
+        let lz4_header = if is_lz4 {
+            let reader = source.open_reader(packages, partitions).await?;
+            Some(Lz4FrameHeader::parse(reader).await?)
+        } else {
+            None
+        };
+        Ok(Self { source, lz4_header })
+    }
+
     /// Total raw size of the payload in bytes in its backing source.
     pub(crate) fn size(&self) -> u64 {
         self.source.size()
@@ -927,29 +957,13 @@ pub(crate) mod tests {
         encoder.write_all(&original).unwrap();
         let compressed = encoder.finish().unwrap();
 
-        let pit_entry = PitEntry {
-            binary_type: samloader_pit::BinaryType::ApplicationProcessor,
-            device_type: samloader_pit::DeviceType::MMC,
-            partition_id: 1,
-            attributes: Default::default(),
-            update_attributes: Default::default(),
-            start_block: 0,
-            block_count: 0,
-            file_offset: 0,
-            file_size: 0,
-            partition_name: Default::default(),
-            flash_filename: Default::default(),
-            fota_filename: Default::default(),
-        };
-
         futures::executor::block_on(async {
             let mut cursor = futures::io::Cursor::new(compressed.as_slice());
             let header = Lz4FrameHeader::parse(&mut cursor).await.unwrap();
             assert_eq!(header.content_size, original.len() as u64);
             assert_eq!(header.block_max_size, 64 * 1024);
 
-            let planned = FirmwarePartitionPayload {
-                pit_entry: &pit_entry,
+            let image = FirmwareImage {
                 source: FirmwarePartitionSource::Image {
                     index: 0,
                     size: compressed.len() as u64,
@@ -961,12 +975,12 @@ pub(crate) mod tests {
 
             // 1. Read a partial prefix and drop the stream (simulating inspect_super_partition)
             {
-                let mut reader = planned
+                let mut reader = image
                     .source
                     .open_reader(&mut packages, &mut partitions)
                     .await
                     .unwrap();
-                let prefix = std::pin::pin!(planned.decompressed_slices(&mut reader, 10 * 1024))
+                let prefix = std::pin::pin!(image.decompressed_slices(&mut reader, 10 * 1024))
                     .next()
                     .await
                     .unwrap()
@@ -978,13 +992,12 @@ pub(crate) mod tests {
             // exercising both open_reader rewind and leftover buffering)
             let mut reassembled = Vec::new();
             {
-                let mut reader = planned
+                let mut reader = image
                     .source
                     .open_reader(&mut packages, &mut partitions)
                     .await
                     .unwrap();
-                let mut slices =
-                    std::pin::pin!(planned.decompressed_slices(&mut reader, 50 * 1024));
+                let mut slices = std::pin::pin!(image.decompressed_slices(&mut reader, 50 * 1024));
                 while let Some(res) = slices.next().await {
                     let slice = res.unwrap();
                     assert!(slice.len() <= 50 * 1024);
@@ -996,7 +1009,7 @@ pub(crate) mod tests {
             // 3. Truncated LZ4 stream must yield Err rather than silently ending with Ok
             let truncated = &compressed[..compressed.len() - 10];
             let mut truncated_reader = futures::io::Cursor::new(truncated);
-            let results: Vec<io::Result<Vec<u8>>> = planned
+            let results: Vec<io::Result<Vec<u8>>> = image
                 .decompressed_slices(&mut truncated_reader, 50 * 1024)
                 .collect()
                 .await;

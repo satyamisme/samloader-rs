@@ -15,7 +15,7 @@
 //! Helper functions for inspecting Android Logical Partition (`liblp`) metadata
 //! and sparse image containers to derive dynamic partition sizing.
 
-use crate::firmware::FirmwarePartitionPayload;
+use crate::firmware::FirmwareImage;
 use futures::StreamExt;
 use futures::io::AsyncRead;
 
@@ -32,21 +32,21 @@ const LP_PRIMARY_HEADER_OFFSET: usize = 0x3000;
 const REQUIRED_LOGICAL_SIZE: usize = 256 * 1024;
 const DECOMPRESS_PREFIX_LIMIT: usize = 512 * 1024;
 
-/// Inspects a [`FirmwarePartitionPayload`] representing a `SUPER` partition and attempts to
-/// parse the active linear extent sizes to determine the `super_used_size` in sectors.
+/// Inspects a [`FirmwareImage`] of a `SUPER` partition and attempts to parse the active
+/// linear extent sizes to determine the `super_used_size` in sectors.
 pub(crate) async fn inspect_super_partition<R: AsyncRead + Unpin>(
-    part: &FirmwarePartitionPayload<'_>,
+    image: &FirmwareImage,
     reader: &mut R,
 ) -> Option<u32> {
-    if part.lz4_header.is_some() {
+    if image.lz4_header.is_some() {
         let decompressed =
-            std::pin::pin!(part.decompressed_slices(reader, DECOMPRESS_PREFIX_LIMIT))
+            std::pin::pin!(image.decompressed_slices(reader, DECOMPRESS_PREFIX_LIMIT))
                 .next()
                 .await?
                 .ok()?;
         inspect_super_bytes(&decompressed)
     } else {
-        let prefix = std::pin::pin!(part.slices(reader, DECOMPRESS_PREFIX_LIMIT))
+        let prefix = std::pin::pin!(image.slices(reader, DECOMPRESS_PREFIX_LIMIT))
             .next()
             .await?
             .ok()?;

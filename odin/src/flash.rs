@@ -17,7 +17,7 @@
 use crate::FlashError;
 use crate::avb;
 use crate::firmware::{
-    FirmwarePartitionPayload, FirmwarePartitionSource, Lz4FrameHeader, PackageEntry, PackageIndex,
+    FirmwareImage, FirmwarePartitionPayload, FirmwarePartitionSource, PackageEntry, PackageIndex,
     normalize_basename, verify_md5_footer,
 };
 use crate::lp::inspect_super_partition;
@@ -386,11 +386,12 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashCo
                 .iter()
                 .find(|p| is_super_entry(p.pit_entry))
             && let Ok(mut reader) = super_part
+                .image
                 .source
                 .open_reader(&mut self.packages, &mut self.partitions)
                 .await
         {
-            self.super_used_size = inspect_super_partition(super_part, &mut reader).await;
+            self.super_used_size = inspect_super_partition(&super_part.image, &mut reader).await;
         }
 
         // Step 3: Flash payloads to the device
@@ -619,28 +620,19 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashCo
                 }
             };
 
-            let lz4_header = if is_lz4 {
-                let mut reader = source
-                    .open_reader(&mut self.packages, &mut self.partitions)
-                    .await
-                    .map_err(|e| FlashError::Lz4Header(display_name.clone(), e))?;
-                let fh = Lz4FrameHeader::parse(&mut reader)
+            let image =
+                FirmwareImage::inspect(source, is_lz4, &mut self.packages, &mut self.partitions)
                     .await
                     .map_err(|e| FlashError::Lz4Header(display_name, e))?;
-                Some(fh)
-            } else {
-                None
-            };
 
             let planned = FirmwarePartitionPayload {
                 pit_entry: candidate.pit_entry,
-                source,
-                lz4_header,
+                image,
             };
 
             if !self.skip_size_check {
                 let partition_size = planned.pit_entry.partition_size();
-                if partition_size > 0 && planned.uncompressed_size() > partition_size {
+                if partition_size > 0 && planned.image.uncompressed_size() > partition_size {
                     return Err(FlashError::PartitionTooSmall(
                         planned
                             .pit_entry
@@ -687,11 +679,16 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashCo
             // The patched image is sent uncompressed, bypassing LZ4 passthrough
             let mut data = {
                 let mut reader = planned
+                    .image
                     .source
                     .open_reader(&mut self.packages, &mut self.partitions)
                     .await
                     .map_err(rewrite_err)?;
-                planned.read_all(&mut reader).await.map_err(rewrite_err)?
+                planned
+                    .image
+                    .read_all(&mut reader)
+                    .await
+                    .map_err(rewrite_err)?
             };
 
             let Some(offset) = avb::rewrite_vbmeta(&mut data, self.vbmeta_flags, in_footer)
@@ -713,8 +710,10 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashCo
                     name, offset
                 ));
             }
-            planned.lz4_header = None;
-            planned.source = FirmwarePartitionSource::Memory(data);
+            planned.image = FirmwareImage {
+                source: FirmwarePartitionSource::Memory(data),
+                lz4_header: None,
+            };
             rewritten = true;
         }
 
@@ -736,7 +735,7 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashCo
     ) -> Result<(), FlashError> {
         let total_bytes: u64 = planned_partitions
             .iter()
-            .map(FirmwarePartitionPayload::uncompressed_size)
+            .map(|p| p.image.uncompressed_size())
             .sum();
 
         session.set_total_bytes(total_bytes).await?;
@@ -759,7 +758,7 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashCo
 
         for planned in planned_partitions {
             let name = planned.pit_entry.partition_name.to_string_lossy();
-            let partition_size = planned.uncompressed_size();
+            let partition_size = planned.image.uncompressed_size();
 
             progress::on_event(FlashEvent::PartitionStart {
                 name: &name,
@@ -768,6 +767,7 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashCo
 
             let res = async {
                 let mut reader = planned
+                    .image
                     .source
                     .open_reader(&mut self.packages, &mut self.partitions)
                     .await?;
@@ -802,6 +802,7 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashCo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::firmware::Lz4FrameHeader;
     use crate::firmware::tests::build_tar;
     use crate::odin::OdinConnection;
     use crate::usb::{MockBackend, MockEvent};
@@ -1086,8 +1087,8 @@ mod tests {
         planned: &FirmwarePartitionPayload<'_>,
         partitions: &[Cursor<Vec<u8>>],
     ) -> Vec<u8> {
-        assert!(planned.lz4_header.is_none());
-        match &planned.source {
+        assert!(planned.image.lz4_header.is_none());
+        match &planned.image.source {
             FirmwarePartitionSource::Memory(data) => data.clone(),
             FirmwarePartitionSource::Image { index, .. } => partitions[*index].get_ref().clone(),
             FirmwarePartitionSource::Package { .. } => unreachable!(),
@@ -1114,26 +1115,34 @@ mod tests {
         let mut planned = vec![
             FirmwarePartitionPayload {
                 pit_entry: find_entry(&pit_data, "VBMETA_A"),
-                source: FirmwarePartitionSource::Image { index: 0, size },
-                lz4_header: None,
+                image: FirmwareImage {
+                    source: FirmwarePartitionSource::Image { index: 0, size },
+                    lz4_header: None,
+                },
             },
             FirmwarePartitionPayload {
                 pit_entry: find_entry(&pit_data, "VBMETA_B"),
-                source: FirmwarePartitionSource::Image {
-                    index: 1,
-                    size: lz4_size,
+                image: FirmwareImage {
+                    source: FirmwarePartitionSource::Image {
+                        index: 1,
+                        size: lz4_size,
+                    },
+                    lz4_header: Some(header),
                 },
-                lz4_header: Some(header),
             },
             FirmwarePartitionPayload {
                 pit_entry: find_entry(&pit_data, "VBMETA_SYSTEM_A"),
-                source: FirmwarePartitionSource::Image { index: 2, size },
-                lz4_header: None,
+                image: FirmwareImage {
+                    source: FirmwarePartitionSource::Image { index: 2, size },
+                    lz4_header: None,
+                },
             },
             FirmwarePartitionPayload {
                 pit_entry: find_entry(&pit_data, "BOOT_A"),
-                source: FirmwarePartitionSource::Image { index: 3, size },
-                lz4_header: None,
+                image: FirmwareImage {
+                    source: FirmwarePartitionSource::Image { index: 3, size },
+                    lz4_header: None,
+                },
             },
         ];
 
@@ -1167,8 +1176,10 @@ mod tests {
         let size = lz4_bytes.len() as u64;
         let mut planned = vec![FirmwarePartitionPayload {
             pit_entry: find_entry(&pit_data, "VBMETA_A"),
-            source: FirmwarePartitionSource::Image { index: 0, size },
-            lz4_header: Some(header),
+            image: FirmwareImage {
+                source: FirmwarePartitionSource::Image { index: 0, size },
+                lz4_header: Some(header),
+            },
         }];
 
         rewrite_vbmeta(
@@ -1179,7 +1190,7 @@ mod tests {
             false,
         )
         .unwrap();
-        assert!(planned[0].lz4_header.is_some());
+        assert!(planned[0].image.lz4_header.is_some());
     }
 
     #[test]
@@ -1187,11 +1198,13 @@ mod tests {
         let pit_data = ab_pit_data();
         let mut planned = vec![FirmwarePartitionPayload {
             pit_entry: find_entry(&pit_data, "VBMETA_A"),
-            source: FirmwarePartitionSource::Image {
-                index: 0,
-                size: 4096,
+            image: FirmwareImage {
+                source: FirmwarePartitionSource::Image {
+                    index: 0,
+                    size: 4096,
+                },
+                lz4_header: None,
             },
-            lz4_header: None,
         }];
 
         assert!(matches!(
@@ -1226,22 +1239,26 @@ mod tests {
 
         let mut planned = vec![FirmwarePartitionPayload {
             pit_entry: find_entry(&pit_data, "BOOT"),
-            source: FirmwarePartitionSource::Image {
-                index: 0,
-                size: boot.len() as u64,
+            image: FirmwareImage {
+                source: FirmwarePartitionSource::Image {
+                    index: 0,
+                    size: boot.len() as u64,
+                },
+                lz4_header: None,
             },
-            lz4_header: None,
         }];
         rewrite_vbmeta(&pit_data, vec![Cursor::new(boot)], &mut planned, true, true).unwrap();
         assert_eq!(vbmeta_flags(&planned_bytes(&planned[0], &[]), 0x1000), 0x3);
 
         let mut planned = vec![FirmwarePartitionPayload {
             pit_entry: find_entry(&pit_data, "BOOT"),
-            source: FirmwarePartitionSource::Image {
-                index: 0,
-                size: 4096,
+            image: FirmwareImage {
+                source: FirmwarePartitionSource::Image {
+                    index: 0,
+                    size: 4096,
+                },
+                lz4_header: None,
             },
-            lz4_header: None,
         }];
         assert!(matches!(
             rewrite_vbmeta(

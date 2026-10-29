@@ -556,21 +556,22 @@ impl OdinSession {
         reader: &mut R,
     ) -> Result<(), OdinError> {
         let pit_entry = part.pit_entry;
-        let Some(header) = &part.lz4_header else {
-            progress::set_length(part.size());
-            let slices = part.slices(reader, MAX_SLICE_SIZE);
+        let image = &part.image;
+        let Some(header) = &image.lz4_header else {
+            progress::set_length(image.size());
+            let slices = image.slices(reader, MAX_SLICE_SIZE);
             return self.transmit_slices(slices, pit_entry).await;
         };
 
         if !self.lz4_supported || header.block_max_size != 1024 * 1024 {
             progress::set_length(header.content_size);
-            let slices = part.decompressed_slices(reader, MAX_SLICE_SIZE);
+            let slices = image.decompressed_slices(reader, MAX_SLICE_SIZE);
             return self.transmit_slices(slices, pit_entry).await;
         }
 
-        progress::set_length(part.size());
+        progress::set_length(image.size());
 
-        let slices = part.compressed_slices(reader, MAX_SLICE_SIZE);
+        let slices = image.compressed_slices(reader, MAX_SLICE_SIZE);
 
         let mut slices = std::pin::pin!(slices.peekable());
         while let Some(slice_res) = slices.next().await {
