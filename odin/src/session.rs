@@ -525,6 +525,11 @@ impl OdinSession {
     }
 
     /// Transmits a partition image as a stream of raw slices.
+    ///
+    /// The next slice is read from `slices` while the current one is being
+    /// sent. This only overlaps reading with the USB transfer if the stream
+    /// returns `Pending` while its I/O is in progress; a stream that blocks is
+    /// read to completion before the current slice is started.
     pub(crate) async fn send_slices<S, Bytes>(
         &mut self,
         pit_entry: &PitEntry,
@@ -534,25 +539,33 @@ impl OdinSession {
         Bytes: AsRef<[u8]>,
         S: Stream<Item = std::io::Result<Bytes>>,
     {
-        let mut slices = std::pin::pin!(slices.peekable());
-        while let Some(slice_data) = slices.next().await {
-            let slice_data = slice_data?;
+        let mut slices = std::pin::pin!(slices);
+        let mut current = slices.next().await.transpose()?;
+        while let Some(slice_data) = current {
             let slice_data = slice_data.as_ref();
             let init_cmd = Command::transmit_flash(false);
             let start_cmd = Command::start_slice_transmission(slice_data.len() as u32);
 
-            let is_last_slice = slices.as_mut().peek().await.is_none();
+            // The read is polled first, so that a blocking reader finishes
+            // before the slice is started, like a sequential loop would
+            let (next, sent) = futures::future::join(
+                slices.next(),
+                self.transmit_slice_data(&init_cmd, &start_cmd, slice_data),
+            )
+            .await;
+            sent?;
+            let next = next.transpose()?;
+
+            // Whether this is the last slice is only needed once the data is sent
             let end_cmd = Command::commit_slice(
                 slice_data.len() as u32,
                 pit_entry,
-                is_last_slice,
+                next.is_none(),
                 false,
                 self.bootloader_protocol_version,
             );
-
-            self.transmit_slice_data(&init_cmd, &start_cmd, slice_data)
-                .await?;
             self.commit_slice(&end_cmd).await?;
+            current = next;
         }
 
         Ok(())
@@ -562,7 +575,8 @@ impl OdinSession {
     /// paired with its decompressed size.
     ///
     /// Only valid if [`accepts_lz4_blocks`](Self::accepts_lz4_blocks) holds
-    /// for the frame the slices come from.
+    /// for the frame the slices come from. Like [`send_slices`](Self::send_slices),
+    /// the next slice is read while the current one is being sent.
     pub(crate) async fn send_lz4_slices<S>(
         &mut self,
         pit_entry: &PitEntry,
@@ -571,27 +585,35 @@ impl OdinSession {
     where
         S: Stream<Item = std::io::Result<(usize, Vec<u8>)>>,
     {
-        let mut slices = std::pin::pin!(slices.peekable());
-        while let Some(slice_res) = slices.next().await {
-            let (decompressed_size, slice_data) = slice_res?;
+        let mut slices = std::pin::pin!(slices);
+        let mut current = slices.next().await.transpose()?;
+        while let Some((decompressed_size, slice_data)) = current {
             let init_cmd = Command::transmit_flash(true);
             let start_cmd = Command::start_lz4_slice_transmission(
                 slice_data.len() as u32,
                 decompressed_size as u32,
             );
 
-            let is_last_slice = slices.as_mut().peek().await.is_none();
+            // The read is polled first, so that a blocking reader finishes
+            // before the slice is started, like a sequential loop would
+            let (next, sent) = futures::future::join(
+                slices.next(),
+                self.transmit_slice_data(&init_cmd, &start_cmd, &slice_data),
+            )
+            .await;
+            sent?;
+            let next = next.transpose()?;
+
+            // Whether this is the last slice is only needed once the data is sent
             let end_cmd = Command::commit_slice(
                 decompressed_size as u32,
                 pit_entry,
-                is_last_slice,
+                next.is_none(),
                 true,
                 self.bootloader_protocol_version,
             );
-
-            self.transmit_slice_data(&init_cmd, &start_cmd, &slice_data)
-                .await?;
             self.commit_slice(&end_cmd).await?;
+            current = next;
         }
 
         Ok(())
@@ -711,7 +733,8 @@ mod tests {
     use super::*;
     use crate::protocol::CMD_SESSION_INIT;
     use crate::test_util::mock_session;
-    use crate::usb::MockBackend;
+    use crate::usb::{MockBackend, MockEvent};
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn test_odin_mock_multi_slice_transfer() {
@@ -749,6 +772,51 @@ mod tests {
                 session.send_slices(&pit_entry, failing_slices).await,
                 Err(OdinError::Io(_))
             ));
+
+            assert!(session.close().await.is_ok());
+        });
+    }
+
+    #[test]
+    fn test_send_slices_reads_next_slice_while_sending() {
+        futures::executor::block_on(async {
+            let backend = MockBackend::new();
+            let log = backend.event_log();
+            let chunks = backend.received_chunks();
+            let mut session = mock_session(backend).await;
+            let pit_data = crate::test_util::ab_pit_data();
+            let pit_entry = crate::test_util::find_entry(&pit_data, "BOOT_A");
+
+            // 3 slices of 2 packets each. Each read takes longer than sending a
+            // slice, and records how far the transfer is once it completes.
+            let packet_size = session.packet_size;
+            let progress = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let slices = futures::stream::iter(0..3u8).then(|idx| {
+                let (log, chunks, progress) = (log.clone(), chunks.clone(), progress.clone());
+                async move {
+                    for _ in 0..20 {
+                        crate::usb::yield_now().await;
+                    }
+                    let committed = log.lock().unwrap().len();
+                    progress
+                        .lock()
+                        .unwrap()
+                        .push((chunks.load(Ordering::Relaxed), committed));
+                    Ok(vec![idx; 2 * packet_size])
+                }
+            });
+            assert!(session.send_slices(pit_entry, slices).await.is_ok());
+
+            // Each slice is read while the previous one is sent, and is ready
+            // before the previous one is committed
+            assert_eq!(*progress.lock().unwrap(), [(0, 0), (2, 0), (4, 1)]);
+            let last: Vec<_> = log
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|e| matches!(e, MockEvent::Slice { last: true, .. }))
+                .collect();
+            assert_eq!(last, [false, false, true]);
 
             assert!(session.close().await.is_ok());
         });

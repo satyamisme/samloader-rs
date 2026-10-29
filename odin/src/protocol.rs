@@ -185,6 +185,14 @@ impl SliceCommit {
         }
     }
 
+    #[cfg(mock_backend)]
+    pub(crate) fn is_end_of_file(&self) -> bool {
+        match self {
+            Self::Unified { is_end_of_file, .. } => *is_end_of_file != 0,
+            Self::LegacyModem { is_end_of_file, .. } => *is_end_of_file != 0,
+        }
+    }
+
     pub(crate) fn new(
         slice_size: u32,
         pit_entry: &PitEntry,

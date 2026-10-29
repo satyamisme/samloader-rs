@@ -29,6 +29,7 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::io::Cursor;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
@@ -79,6 +80,8 @@ pub enum MockEvent {
         partition_id: u32,
         /// Whether the payload was sent with LZ4 compression.
         lz4: bool,
+        /// Whether the slice was committed as the last one of the partition.
+        last: bool,
         /// The received payload data, truncated to the announced slice size.
         data: Vec<u8>,
     },
@@ -413,6 +416,7 @@ pub struct MockBackend {
     product_override: Option<String>,
     empty_send_count: usize,
     event_log: Arc<Mutex<Vec<MockEvent>>>,
+    received_chunks: Arc<AtomicUsize>,
     current_slice_announced_size: Option<usize>,
     current_slice_data: Vec<u8>,
 }
@@ -462,6 +466,7 @@ impl MockBackend {
             product_override: None,
             empty_send_count: 0,
             event_log: Arc::new(Mutex::new(Vec::new())),
+            received_chunks: Arc::new(AtomicUsize::new(0)),
             current_slice_announced_size: None,
             current_slice_data: Vec::new(),
         }
@@ -470,6 +475,12 @@ impl MockBackend {
     /// Returns a handle to the log of device-visible events, shared with clones of the handle.
     pub fn event_log(&self) -> Arc<Mutex<Vec<MockEvent>>> {
         Arc::clone(&self.event_log)
+    }
+
+    /// Returns a handle to the number of slice data chunks acknowledged so far,
+    /// shared with clones of the handle.
+    pub fn received_chunks(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.received_chunks)
     }
 
     /// Returns a reference to the active `DeviceProfile`.
@@ -638,6 +649,7 @@ impl UsbTransfer for MockBackend {
                             .extend_from_slice(&self.incoming_buffer[..chunk_size]);
                         self.push_response(STREAMING_CHUNK_ACK, self.current_chunk_index);
                         self.current_chunk_index += 1;
+                        self.received_chunks.fetch_add(1, Ordering::Relaxed);
                     }
                     self.incoming_buffer.drain(..chunk_size);
                     return true;
@@ -795,6 +807,7 @@ impl UsbTransfer for MockBackend {
                                         self.event_log.lock().unwrap().push(MockEvent::Slice {
                                             partition_id,
                                             lz4,
+                                            last: commit.is_end_of_file(),
                                             data,
                                         });
 

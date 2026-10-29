@@ -60,5 +60,8 @@ mod nusb;
 #[allow(unused_imports)]
 pub use mock::{DeviceProfile, DeviceProfileBuilder, MockBackend, MockEvent};
 
+#[cfg(test)]
+pub(crate) use mock::yield_now;
+
 #[cfg(mock_backend)]
 mod mock;
