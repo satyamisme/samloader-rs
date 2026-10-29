@@ -14,11 +14,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::PartitionArg;
+use crate::cli::FlashArgs;
 use crate::progress::CliProgress;
 use crate::session::connect;
 use samloader_odin::{
-    FlashConfig, RebootMode, UsbBackendOption,
+    FlashConfig, UsbBackendOption,
     futures::{executor::block_on, io::AllowStdIo},
     set_progress,
 };
@@ -46,53 +46,6 @@ fn confirm(question: &str) -> bool {
     }
 }
 
-pub(crate) struct FlashArgs {
-    /// The USB backend used to communicate with the device
-    pub(crate) usb_backend: UsbBackendOption,
-
-    /// Whether to enable verbose output
-    pub(crate) verbose: bool,
-
-    /// How the device reboots after flashing
-    pub(crate) reboot_mode: RebootMode,
-
-    /// Wait until a compatible device is connected
-    pub(crate) wait: bool,
-
-    /// Do not verify that files fit in their partitions
-    pub(crate) skip_size_check: bool,
-
-    /// Skip MD5 checksum verification of packages
-    pub(crate) skip_md5: bool,
-
-    /// Optional: the PIT file to flash to the device
-    pub(crate) pit: Option<String>,
-
-    /// TAR packages to flash
-    pub(crate) packages: Vec<String>,
-
-    /// Individual partition images to flash
-    pub(crate) partitions: Vec<PartitionArg>,
-
-    /// File or partition names to exclude from flashing
-    pub(crate) skip: Vec<String>,
-
-    /// Set disable-verity when flashing vbmeta
-    pub(crate) disable_verity: bool,
-
-    /// Set disable-verification when flashing vbmeta
-    pub(crate) disable_verification: bool,
-
-    /// Optional: CSC code to set on the device
-    pub(crate) csc_code: Option<String>,
-
-    /// Perform a NAND erase on USERDATA before flashing
-    pub(crate) erase: bool,
-
-    /// Flash userdata without asking for confirmation
-    pub(crate) force: bool,
-}
-
 // Opens a file for reading by the async flashing pipeline
 fn open(path: &str) -> Result<AllowStdIo<File>, String> {
     File::open(path)
@@ -100,54 +53,54 @@ fn open(path: &str) -> Result<AllowStdIo<File>, String> {
         .map_err(|e| format!("Failed to open file \"{}\": {}", path, e))
 }
 
-pub(crate) fn action_flash(args: FlashArgs) -> Result<(), Box<dyn Error>> {
-    let FlashArgs {
-        usb_backend,
-        verbose,
-        reboot_mode,
-        wait,
-        skip_size_check,
-        skip_md5,
-        pit,
-        packages,
-        partitions,
-        skip,
-        disable_verity,
-        disable_verification,
-        csc_code,
-        erase,
-        force,
-    } = args;
+pub(crate) fn action_flash(
+    args: FlashArgs,
+    usb_backend: UsbBackendOption,
+    verbose: bool,
+) -> Result<(), Box<dyn Error>> {
+    if args.packages().next().is_none()
+        && args.partition.is_empty()
+        && args.file.is_empty()
+        && args.csc_code.is_none()
+        && !args.erase
+        && !args.odin.redownload
+    {
+        return Err(
+            "No packages, files, partitions, CSC code, erase option, or redownload \
+                    option specified for flashing."
+                .into(),
+        );
+    }
 
-    let opened_packages = packages
-        .iter()
-        .map(|pkg| Ok((pkg.clone(), open(pkg)?)))
+    let opened_packages = args
+        .packages()
+        .map(|pkg| Ok((pkg, open(pkg)?)))
         .collect::<Result<Vec<_>, String>>()?;
 
-    let opened_partitions = partitions
-        .iter()
-        .map(|p| Ok((p.name.clone(), p.filename.as_str(), open(&p.filename)?)))
+    let opened_partitions = args
+        .partitions()
+        .map(|(name, file)| Ok((name, file, open(file)?)))
         .collect::<Result<Vec<_>, String>>()?;
 
-    let pit_bytes = match pit {
+    let pit_bytes = match &args.pit {
         Some(pit_path) => Some(
-            std::fs::read(&pit_path)
+            std::fs::read(pit_path)
                 .map_err(|e| format!("Failed to read file \"{}\": {}", pit_path, e))?,
         ),
         None => None,
     };
 
     let mut config = FlashConfig::new()
-        .reboot_mode(reboot_mode)
-        .skip_size_check(skip_size_check)
-        .skip_md5(skip_md5)
-        .erase(erase)
+        .reboot_mode(args.odin.reboot_mode())
+        .skip_size_check(args.skip_size_check)
+        .skip_md5(args.skip_md5)
+        .erase(args.erase)
         .packages(opened_packages)
         .partitions(opened_partitions)
-        .skip(&skip)
-        .disable_verity(disable_verity)
-        .disable_verification(disable_verification)
-        .sales_code(csc_code.as_deref());
+        .skip(&args.skip)
+        .disable_verity(args.disable_verity)
+        .disable_verification(args.disable_verification)
+        .sales_code(args.csc_code.as_deref());
 
     if let Some(buffer) = pit_bytes {
         config = config.pit(buffer);
@@ -157,7 +110,7 @@ pub(crate) fn action_flash(args: FlashArgs) -> Result<(), Box<dyn Error>> {
     set_progress(CliProgress::new(verbose));
     let blueprint = block_on(config.preplan())?;
 
-    if !force && blueprint.flashes_userdata() {
+    if !args.force && blueprint.flashes_userdata() {
         if !io::stdin().is_terminal() {
             return Err(
                 "Flash list contains userdata, which will wipe the device's data. \
@@ -171,7 +124,7 @@ pub(crate) fn action_flash(args: FlashArgs) -> Result<(), Box<dyn Error>> {
     }
 
     block_on(async {
-        let mut session = connect(usb_backend, wait).await?;
+        let mut session = connect(usb_backend, args.odin.wait).await?;
         blueprint.execute(&mut session).await?;
         Ok(())
     })

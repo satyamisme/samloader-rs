@@ -19,7 +19,7 @@ Commands:
 
 Options:
       --verbose                    Enable verbose output
-      --usb-backend <usb_backend>  The USB backend to use [default: nusb] [possible values: nusb, vcom]
+      --usb-backend <USB_BACKEND>  The USB backend to use [default: nusb] [possible values: nusb, vcom]
   -h, --help                       Print help
   -V, --version                    Print version
 ```

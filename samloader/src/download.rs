@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::cli::DownloadArgs;
 use indicatif::{ProgressBar, ProgressStyle};
 use samloader_fus::{
     DownloadOptions, DownloadProgress, FusClient, download_firmware, fetch_version_xml,
@@ -21,32 +22,6 @@ use std::time::Duration;
 
 const PROGRESS_TEMPLATE: &str =
     "[{elapsed_precise}] [{bar:40}] {bytes}/{total_bytes} ({bytes_per_sec}) [{eta_precise}]";
-
-pub(crate) struct DownloadArgs {
-    /// The model name (e.g. SM-S931U1)
-    pub(crate) model: String,
-
-    /// Region CSC code (e.g. XAA)
-    pub(crate) region: String,
-
-    /// Optional: firmware version. If None, downloads the latest.
-    pub(crate) version: Option<String>,
-
-    /// Number of parallel connections
-    pub(crate) threads: u64,
-
-    /// Optional: the output directory
-    pub(crate) out_dir: Option<String>,
-
-    /// Optional: the output file name
-    pub(crate) out_file: Option<String>,
-
-    /// Overwrite existing files and discard any partial download
-    pub(crate) force: bool,
-
-    /// Whether to enable verbose output
-    pub(crate) verbose: bool,
-}
 
 struct ProgressWrapper<'a> {
     progress_bar: &'a ProgressBar,
@@ -84,21 +59,21 @@ impl DownloadProgress for ProgressWrapper<'_> {
     }
 }
 
-pub(crate) fn action_download(args: DownloadArgs) -> Result<(), Box<dyn Error>> {
+pub(crate) fn action_download(args: DownloadArgs, verbose: bool) -> Result<(), Box<dyn Error>> {
     let mut client = FusClient::new().expect("Unable to establish FusClient");
 
     let version = match &args.version {
         Some(v) => v.clone(),
         None => {
             let version_info = client
-                .fetch_history(&args.model, &args.region)
-                .or_else(|_| fetch_version_xml(&args.model, &args.region))
+                .fetch_history(&args.fus.model, &args.fus.region)
+                .or_else(|_| fetch_version_xml(&args.fus.model, &args.fus.region))
                 .expect("Failed to fetch version info");
             version_info.latest
         }
     };
 
-    client.fetch_binary_info(&args.model, &args.region, &version);
+    client.fetch_binary_info(&args.fus.model, &args.fus.region, &version);
 
     println!("Firmware Version: {}", client.info.version);
 
@@ -123,7 +98,7 @@ pub(crate) fn action_download(args: DownloadArgs) -> Result<(), Box<dyn Error>> 
 
     let wrapper = ProgressWrapper {
         progress_bar: &progress,
-        verbose: args.verbose,
+        verbose,
     };
 
     let options = DownloadOptions {
