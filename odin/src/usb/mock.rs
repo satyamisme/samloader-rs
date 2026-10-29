@@ -26,8 +26,31 @@ use crate::usb::{UsbBackend, UsbTransfer};
 use binrw::BinRead;
 use samloader_pit::PitData;
 use std::collections::VecDeque;
+use std::future::Future;
 use std::io::Cursor;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+
+/// Returns `Pending` once before completing, waking itself immediately, like
+/// an I/O operation that completes right away.
+pub(crate) fn yield_now() -> impl Future<Output = ()> {
+    struct YieldNow(bool);
+
+    impl Future for YieldNow {
+        type Output = ();
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if self.0 {
+                return Poll::Ready(());
+            }
+            self.0 = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+
+    YieldNow(false)
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -366,6 +389,9 @@ impl DeviceProfileBuilder {
 
 /// A mock USB/serial transport backend that implements the Loke-Odin protocol,
 /// capable of accurately simulating different Samsung device generations.
+///
+/// Like real USB transfers, every send and receive returns `Pending` once
+/// before completing.
 pub struct MockBackend {
     profile: DeviceProfile,
     state: State,
@@ -560,6 +586,7 @@ impl UsbTransfer for MockBackend {
     }
 
     async fn send_data(&mut self, data: &[u8], _timeout: i32) -> bool {
+        yield_now().await;
         if data.is_empty() {
             self.empty_send_count += 1;
             return true;
@@ -847,6 +874,7 @@ impl UsbTransfer for MockBackend {
     }
 
     async fn receive_data(&mut self, data: &mut [u8], _timeout: i32) -> i32 {
+        yield_now().await;
         if self.outgoing_queue.is_empty() {
             return 0;
         }
