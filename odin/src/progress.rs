@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::usb::{MaybeSend, MaybeSync};
+use crate::compat::{MaybeSend, MaybeSync};
 
 /// Events emitted during firmware flashing and verification.
 #[derive(Debug)]
