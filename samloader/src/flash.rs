@@ -15,7 +15,6 @@
 // limitations under the License.
 
 use crate::PartitionArg;
-use crate::print_error;
 use crate::progress::CliProgress;
 use crate::session::connect;
 use samloader_odin::{
@@ -101,17 +100,7 @@ fn open(path: &str) -> Result<AllowStdIo<File>, String> {
         .map_err(|e| format!("Failed to open file \"{}\": {}", path, e))
 }
 
-pub(crate) fn action_flash(args: FlashArgs) -> i32 {
-    match flash(args) {
-        Ok(()) => 0,
-        Err(e) => {
-            print_error!("{}", e);
-            1
-        }
-    }
-}
-
-fn flash(args: FlashArgs) -> Result<(), Box<dyn Error>> {
+pub(crate) fn action_flash(args: FlashArgs) -> Result<(), Box<dyn Error>> {
     let FlashArgs {
         usb_backend,
         verbose,

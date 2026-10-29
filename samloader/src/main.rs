@@ -41,6 +41,19 @@ macro_rules! print_error {
     };
 }
 
+/// An error that has already been reported to the user, so that only the
+/// exit status remains to be set.
+#[derive(Debug)]
+pub(crate) struct AlreadyReported;
+
+impl std::fmt::Display for AlreadyReported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("errors were reported above")
+    }
+}
+
+impl std::error::Error for AlreadyReported {}
+
 // On Windows, the default USB backend is set to VCOM rather than libusb/nusb.
 // This is because libusb/nusb requires replacing the standard device driver
 // with a WinUSB/generic driver (e.g., using a utility like Zadig).
@@ -473,8 +486,7 @@ fn main() {
                 force,
                 verbose,
             };
-            download::action_download(args);
-            0
+            download::action_download(args)
         }
         Some(("check-update", sub_m)) => {
             let model = sub_m.get_one::<String>("model").cloned().unwrap();
@@ -508,7 +520,7 @@ fn main() {
             } else {
                 println!("{}", info.latest);
             }
-            0
+            Ok(())
         }
         Some(("detect", sub_matches)) => actions::action_detect(
             usb_backend,
@@ -640,7 +652,7 @@ fn main() {
                 erase,
                 force: sub_matches.get_flag("force"),
             };
-            std::process::exit(flash::action_flash(args));
+            flash::action_flash(args)
         }
         Some(("verify-md5", sub_matches)) => {
             let files: Vec<String> = sub_matches
@@ -658,5 +670,10 @@ fn main() {
         _ => unreachable!(),
     };
 
-    std::process::exit(result);
+    if let Err(e) = result {
+        if !e.is::<AlreadyReported>() {
+            print_error!("{}", e);
+        }
+        std::process::exit(1);
+    }
 }

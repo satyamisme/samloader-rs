@@ -16,6 +16,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use samloader_fus::{
     DownloadOptions, DownloadProgress, FusClient, download_firmware, fetch_version_xml,
 };
+use std::error::Error;
 use std::time::Duration;
 
 const PROGRESS_TEMPLATE: &str =
@@ -83,7 +84,7 @@ impl DownloadProgress for ProgressWrapper<'_> {
     }
 }
 
-pub(crate) fn action_download(args: DownloadArgs) {
+pub(crate) fn action_download(args: DownloadArgs) -> Result<(), Box<dyn Error>> {
     let mut client = FusClient::new().expect("Unable to establish FusClient");
 
     let version = match &args.version {
@@ -132,9 +133,11 @@ pub(crate) fn action_download(args: DownloadArgs) {
 
     if let Err(e) = download_firmware(&client, &final_out, options, &wrapper) {
         progress.abandon();
-        eprintln!("\nERROR: Download failed: {e}");
-        std::process::exit(1);
+        // Keep the error apart from the abandoned progress bar
+        eprintln!();
+        return Err(format!("Download failed: {e}").into());
     }
 
     progress.finish();
+    Ok(())
 }

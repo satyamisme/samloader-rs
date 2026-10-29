@@ -13,27 +13,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::print_error;
 use crate::progress::CliProgress;
-use crate::session::connect;
+use crate::session::{connect, finish};
+use crate::{AlreadyReported, print_error};
 use samloader_odin::{
     RebootMode, UsbBackendOption, detect_device,
     futures::{executor::block_on, io::AllowStdIo},
     query_device_info, set_progress, verify_md5_footer,
 };
 use samloader_pit::PitData;
+use std::error::Error;
 use std::fs::File;
 use std::io::{Read, Write};
 
-pub(crate) fn action_detect(usb_backend: UsbBackendOption, wait: bool, json: bool) -> i32 {
+pub(crate) fn action_detect(
+    usb_backend: UsbBackendOption,
+    wait: bool,
+    json: bool,
+) -> Result<(), Box<dyn Error>> {
     if !json {
         set_progress(CliProgress::new(false));
     }
     block_on(async {
-        let detected = detect_device(usb_backend, wait).await;
-        if !detected {
-            eprintln!("ERROR: Failed to detect compatible download-mode device.");
-            return 1;
+        if !detect_device(usb_backend, wait).await {
+            return Err("Failed to detect compatible download-mode device.".into());
         }
 
         match query_device_info(usb_backend, false).await {
@@ -53,7 +56,7 @@ pub(crate) fn action_detect(usb_backend: UsbBackendOption, wait: bool, json: boo
                 }
             }
         }
-        0
+        Ok(())
     })
 }
 
@@ -63,71 +66,34 @@ pub(crate) fn action_dump_pit(
     verbose: bool,
     reboot_mode: RebootMode,
     wait: bool,
-) -> i32 {
+) -> Result<(), Box<dyn Error>> {
     if output.is_empty() {
         println!("Output file was not specified.\n");
-        return 0;
+        return Ok(());
     }
 
-    // Open output file
-    let mut output_file = match File::create(output) {
-        Ok(f) => f,
-        Err(_) => {
-            print_error!("Failed to open output file \"{}\"", output);
-            return 1;
-        }
-    };
+    let mut output_file =
+        File::create(output).map_err(|_| format!("Failed to open output file \"{}\"", output))?;
 
     set_progress(CliProgress::new(verbose));
 
     block_on(async {
-        // Download PIT file from device.
-        let mut session = match connect(usb_backend, wait).await {
-            Ok(s) => s,
-            Err(e) => {
-                print_error!("{}", e);
-                return 1;
-            }
-        };
-
-        let mut success = true;
+        let mut session = connect(usb_backend, wait).await?;
 
         println!("Downloading device's PIT file");
-        match session.receive_pit_info().await {
-            Ok(pit_buffer) => {
-                if let Err(e) = output_file.write_all(&pit_buffer) {
-                    print_error!("Failed to write PIT data to output file: {}", e);
-                    success = false;
-                }
-            }
-            Err(e) => {
-                print_error!("{}", e);
-                success = false;
-            }
+        let dumped: Result<(), Box<dyn Error>> = async {
+            let pit_buffer = session.receive_pit_info().await?;
+            output_file
+                .write_all(&pit_buffer)
+                .map_err(|e| format!("Failed to write PIT data to output file: {}", e))?;
+            Ok(())
         }
+        .await;
 
-        if let Err(e) = session.end_session().await {
-            print_error!("{}", e);
-            success = false;
-        }
-
-        match reboot_mode {
-            RebootMode::Normal => {
-                if let Err(e) = session.reboot_device().await {
-                    print_error!("{}", e);
-                    success = false;
-                }
-            }
-            RebootMode::Download => {
-                if let Err(e) = session.reboot_to_download().await {
-                    print_error!("{}", e);
-                    success = false;
-                }
-            }
-            RebootMode::None => {}
-        }
-
-        if success { 0 } else { 1 }
+        // End the session and reboot even if the PIT could not be dumped
+        let finished = finish(&mut session, reboot_mode).await;
+        dumped?;
+        Ok(finished?)
     })
 }
 
@@ -137,111 +103,54 @@ pub(crate) fn action_print_pit(
     verbose: bool,
     reboot_mode: RebootMode,
     wait: bool,
-) -> i32 {
+) -> Result<(), Box<dyn Error>> {
     if !file.is_empty() {
-        let mut f = match File::open(file) {
-            Ok(f) => f,
-            Err(_) => {
-                print_error!("Failed to open file \"{}\"", file);
-                return 1;
-            }
-        };
+        let mut f = File::open(file).map_err(|_| format!("Failed to open file \"{}\"", file))?;
 
         let mut buffer = Vec::new();
-        if f.read_to_end(&mut buffer).is_err() {
-            print_error!("Failed to read file \"{}\"", file);
-            return 1;
-        }
+        f.read_to_end(&mut buffer)
+            .map_err(|_| format!("Failed to read file \"{}\"", file))?;
 
-        match PitData::new(&buffer) {
-            Ok(pit_data) => {
-                println!("{}", pit_data);
-                0
-            }
-            Err(_) => {
-                print_error!("Failed to unpack PIT file!");
-                1
-            }
-        }
-    } else {
-        set_progress(CliProgress::new(verbose));
-
-        block_on(async {
-            let mut session = match connect(usb_backend, wait).await {
-                Ok(s) => s,
-                Err(e) => {
-                    print_error!("{}", e);
-                    return 1;
-                }
-            };
-
-            let mut success = true;
-            let mut device_pit_data = None;
-
-            println!("Downloading device's PIT file");
-            match session.receive_pit_info().await {
-                Ok(device_pit) => match PitData::new(&device_pit) {
-                    Ok(pit_data) => {
-                        device_pit_data = Some(pit_data);
-                    }
-                    Err(_) => {
-                        print_error!("Failed to unpack device's PIT file!");
-                        success = false;
-                    }
-                },
-                Err(e) => {
-                    print_error!("{}", e);
-                    success = false;
-                }
-            }
-
-            if let Some(pit_data) = device_pit_data {
-                println!("{}", pit_data);
-            }
-
-            if let Err(e) = session.end_session().await {
-                print_error!("{}", e);
-                success = false;
-            }
-
-            match reboot_mode {
-                RebootMode::Normal => {
-                    if let Err(e) = session.reboot_device().await {
-                        print_error!("{}", e);
-                        success = false;
-                    }
-                }
-                RebootMode::Download => {
-                    if let Err(e) = session.reboot_to_download().await {
-                        print_error!("{}", e);
-                        success = false;
-                    }
-                }
-                RebootMode::None => {}
-            }
-
-            if success { 0 } else { 1 }
-        })
+        let pit_data = PitData::new(&buffer).map_err(|_| "Failed to unpack PIT file!")?;
+        println!("{}", pit_data);
+        return Ok(());
     }
-}
 
-pub(crate) fn action_reboot_download(usb_backend: UsbBackendOption, verbose: bool) -> i32 {
     set_progress(CliProgress::new(verbose));
+
     block_on(async {
-        match samloader_odin::reboot_download(usb_backend).await {
-            Ok(()) => 0,
-            Err(e) => {
-                print_error!("{}", e);
-                1
-            }
+        let mut session = connect(usb_backend, wait).await?;
+
+        println!("Downloading device's PIT file");
+        let printed: Result<(), Box<dyn Error>> = async {
+            let device_pit = session.receive_pit_info().await?;
+            let pit_data =
+                PitData::new(&device_pit).map_err(|_| "Failed to unpack device's PIT file!")?;
+            println!("{}", pit_data);
+            Ok(())
         }
+        .await;
+
+        // End the session and reboot even if the PIT could not be printed
+        let finished = finish(&mut session, reboot_mode).await;
+        printed?;
+        Ok(finished?)
     })
 }
 
-pub(crate) fn action_verify_md5(files: &[String]) -> i32 {
+pub(crate) fn action_reboot_download(
+    usb_backend: UsbBackendOption,
+    verbose: bool,
+) -> Result<(), Box<dyn Error>> {
+    set_progress(CliProgress::new(verbose));
+    Ok(block_on(samloader_odin::reboot_download(usb_backend))?)
+}
+
+pub(crate) fn action_verify_md5(files: &[String]) -> Result<(), Box<dyn Error>> {
     let mut success = true;
     set_progress(CliProgress::new(false));
     block_on(async {
+        // Verify every file, reporting each failure as it is found
         for file_path in files {
             let file = match File::open(file_path) {
                 Ok(f) => f,
@@ -257,53 +166,44 @@ pub(crate) fn action_verify_md5(files: &[String]) -> i32 {
                 success = false;
             }
         }
-        if success { 0 } else { 1 }
-    })
+    });
+    if success {
+        Ok(())
+    } else {
+        Err(AlreadyReported.into())
+    }
 }
 
 #[cfg(target_os = "linux")]
 const UDEV_RULES_PATH: &str = "/etc/udev/rules.d/60-samloader.rules";
 
 #[cfg(target_os = "linux")]
-pub(crate) fn action_fix_usb() -> i32 {
+pub(crate) fn action_fix_usb() -> Result<(), Box<dyn Error>> {
     if unsafe { libc::geteuid() != 0 } {
-        eprintln!("ERROR: This command must be run as root (e.g., using sudo).");
-        return 1;
+        return Err("This command must be run as root (e.g., using sudo).".into());
     }
 
     println!("Writing udev rule to {}...", UDEV_RULES_PATH);
     let rule = "SUBSYSTEM==\"usb\", ATTR{idVendor}==\"04e8\", TAG+=\"uaccess\"\n";
-    if let Err(e) = std::fs::write(UDEV_RULES_PATH, rule) {
-        eprintln!("ERROR: Failed to write udev rules file: {}", e);
-        return 1;
-    }
+    std::fs::write(UDEV_RULES_PATH, rule)
+        .map_err(|e| format!("Failed to write udev rules file: {}", e))?;
 
     println!("Reloading and triggering udev rules...");
     let status = std::process::Command::new("udevadm")
         .arg("control")
         .arg("--reload-rules")
         .status();
-
-    match status {
-        Ok(s) if s.success() => {}
-        _ => {
-            eprintln!("ERROR: Failed to reload udev rules via udevadm.");
-            return 1;
-        }
+    if !status.is_ok_and(|s| s.success()) {
+        return Err("Failed to reload udev rules via udevadm.".into());
     }
 
     let status = std::process::Command::new("udevadm")
         .arg("trigger")
         .status();
-
-    match status {
-        Ok(s) if s.success() => {}
-        _ => {
-            eprintln!("ERROR: Failed to trigger udev rules via udevadm.");
-            return 1;
-        }
+    if !status.is_ok_and(|s| s.success()) {
+        return Err("Failed to trigger udev rules via udevadm.".into());
     }
 
     println!("SUCCESS: USB udev rules successfully configured and reloaded.");
-    0
+    Ok(())
 }
