@@ -41,7 +41,7 @@ pub use device::{create_backend, detect_device, query_device_info, reboot_downlo
 pub use device_info::{DeviceInfo, SessionDeviceInfo};
 pub use error::{FlashError, LokeError, OdinError};
 pub use firmware::verify_md5_footer;
-pub use flash::{FlashBlueprint, FlashConfig, RebootMode};
+pub use flash::{FlashRequest, PreparedFlash, RebootMode};
 pub use progress::{FlashEvent, FlashProgress, clear_progress, set_progress};
 pub use session::{OdinConnection, OdinSession};
 pub use usb::{UsbBackend, UsbBackendOption, UsbTransfer};

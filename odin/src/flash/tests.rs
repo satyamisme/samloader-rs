@@ -21,10 +21,10 @@ use crate::test_util::{
 };
 use crate::usb::{MockBackend, MockEvent};
 
-impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashConfig<P, I> {
-    /// Pre-plans and executes the flash.
+impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashRequest<P, I> {
+    /// Prepares and executes the flash.
     async fn run(self, session: &mut OdinSession) -> Result<(), FlashError> {
-        self.preplan().await?.execute(session).await
+        self.prepare().await?.execute(session).await
     }
 }
 
@@ -33,12 +33,12 @@ fn test_flash_partitions_super_size_preflight_success() {
     futures::executor::block_on(async {
         let mut session = mock_session(MockBackend::new().with_protocol_version(3)).await;
 
-        let mut blueprint = FlashConfig::new().preplan().await.unwrap();
-        blueprint.has_download_list = true;
+        let mut prepared = FlashRequest::new().prepare().await.unwrap();
+        prepared.has_download_list = true;
 
         assert!(
-            blueprint
-                .flash(&mut session, Resolved::default(), Some(27276104))
+            prepared
+                .flash(&mut session, FlashPlan::default(), Some(27276104))
                 .await
                 .is_ok()
         );
@@ -55,11 +55,11 @@ fn test_flash_partitions_super_size_preflight_rejection() {
         )
         .await;
 
-        let mut blueprint = FlashConfig::new().preplan().await.unwrap();
-        blueprint.has_download_list = true;
+        let mut prepared = FlashRequest::new().prepare().await.unwrap();
+        prepared.has_download_list = true;
 
-        let res = blueprint
-            .flash(&mut session, Resolved::default(), Some(27276104))
+        let res = prepared
+            .flash(&mut session, FlashPlan::default(), Some(27276104))
             .await;
         assert!(matches!(res, Err(FlashError::SuperSizeCheckFailed(_))));
     });
@@ -76,12 +76,12 @@ fn test_flash_partitions_super_size_preflight_skipped_on_legacy_protocol() {
         )
         .await;
 
-        let mut blueprint = FlashConfig::new().preplan().await.unwrap();
-        blueprint.has_download_list = true;
+        let mut prepared = FlashRequest::new().prepare().await.unwrap();
+        prepared.has_download_list = true;
 
         assert!(
-            blueprint
-                .flash(&mut session, Resolved::default(), Some(27276104))
+            prepared
+                .flash(&mut session, FlashPlan::default(), Some(27276104))
                 .await
                 .is_ok()
         );
@@ -106,8 +106,8 @@ fn test_download_and_parse_pit_flashes_available_pit() {
 
 fn skipped_names(targets: &[&str]) -> Result<Vec<String>, FlashError> {
     let pit_data = ab_pit_data();
-    let config = FlashConfig::new().skip(targets);
-    let skipped_ids = config.options.skipped_partition_ids(&pit_data)?;
+    let request = FlashRequest::new().skip(targets);
+    let skipped_ids = request.options.skipped_partition_ids(&pit_data)?;
     let mut names: Vec<String> = pit_data
         .entries
         .iter()
@@ -165,15 +165,15 @@ fn test_resolve_drops_skipped_partitions() {
 
     futures::executor::block_on(async {
         let pit_data = ab_pit_data();
-        let mut blueprint = FlashConfig::new()
+        let mut prepared = FlashRequest::new()
             .partitions(partitions)
             .skip(&["boot.img", "VBMETA"])
-            .preplan()
+            .prepare()
             .await
             .unwrap();
-        let resolved = blueprint.resolve(&pit_data, true).await.unwrap();
+        let plan = prepared.resolve(&pit_data, true).await.unwrap();
 
-        let names: Vec<String> = resolved
+        let names: Vec<String> = plan
             .payloads
             .iter()
             .map(|p| p.pit_entry.partition_name.to_string_lossy().into_owned())
@@ -199,7 +199,7 @@ fn test_execute_skipping_super_skips_super_size_check() {
                     .with_fail_check_super_size(-1),
             )
             .await;
-            FlashConfig::new()
+            FlashRequest::new()
                 .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
                 .skip(skip)
                 .run(&mut session)
@@ -219,14 +219,14 @@ fn rewrite_vbmeta(
     verification: bool,
 ) -> Result<(), FlashError> {
     futures::executor::block_on(async {
-        let mut blueprint = FlashConfig::new()
+        let mut prepared = FlashRequest::new()
             .partitions(partitions.into_iter().map(|r| (None, "part", r)))
             .disable_verity(verity)
             .disable_verification(verification)
-            .preplan()
+            .prepare()
             .await
             .unwrap();
-        blueprint
+        prepared
             .rewrite_vbmeta_payloads(pit_data, planned, true)
             .await
     })
@@ -437,7 +437,7 @@ fn test_execute_disable_verity_with_lz4_vbmeta() {
             ))
             .await;
             assert!(session.is_lz4_supported());
-            FlashConfig::new()
+            FlashRequest::new()
                 .packages([(name, Cursor::new(tar_bytes))])
                 .disable_verity(verity)
                 .run(&mut session)
@@ -465,7 +465,7 @@ fn test_execute_truncated_package_fails_before_device() {
         let events = backend.event_log();
         let mut session = mock_session(backend).await;
 
-        let res = FlashConfig::new()
+        let res = FlashRequest::new()
             .erase(true)
             .packages([("AP.tar", Cursor::new(truncated))])
             .run(&mut session)
@@ -492,7 +492,7 @@ fn test_execute_bad_skip_target_does_not_erase() {
         let events = backend.event_log();
         let mut session = mock_session(backend).await;
 
-        let res = FlashConfig::new()
+        let res = FlashRequest::new()
             .erase(true)
             .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
             .skip(&["nonexistent_partition"])
@@ -520,7 +520,7 @@ fn test_execute_invalid_vbmeta_does_not_flash_pit() {
         let events = backend.event_log();
         let mut session = mock_session(backend).await;
 
-        let res = FlashConfig::new()
+        let res = FlashRequest::new()
             .pit(Q7MQ_PIT)
             .erase(true)
             .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
@@ -547,7 +547,7 @@ fn test_execute_order_with_local_pit() {
         let events = backend.event_log();
         let mut session = mock_session(backend).await;
 
-        FlashConfig::new()
+        FlashRequest::new()
             .pit(Q7MQ_PIT)
             .erase(true)
             .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
@@ -573,7 +573,7 @@ fn test_execute_order_without_local_pit() {
         let events = backend.event_log();
         let mut session = mock_session(backend).await;
 
-        FlashConfig::new()
+        FlashRequest::new()
             .erase(true)
             .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
             .run(&mut session)
@@ -597,7 +597,7 @@ fn test_execute_invalid_local_pit_rejected_early() {
         let events = backend.event_log();
         let mut session = mock_session(backend).await;
 
-        let res = FlashConfig::new()
+        let res = FlashRequest::new()
             .pit(b"invalid_pit_bytes")
             .erase(true)
             .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
@@ -627,7 +627,7 @@ fn test_execute_vbmeta_payload_flags() {
         let events = backend.event_log();
         let mut session = mock_session(backend).await;
 
-        FlashConfig::new()
+        FlashRequest::new()
             .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
             .disable_verity(true)
             .disable_verification(true)
@@ -658,7 +658,7 @@ fn test_execute_vbmeta_payload_flags() {
         let events = backend.event_log();
         let mut session = mock_session(backend).await;
 
-        FlashConfig::new()
+        FlashRequest::new()
             .packages([("AP.tar", Cursor::new(raw_tar.as_slice()))])
             .run(&mut session)
             .await
@@ -683,7 +683,7 @@ fn test_execute_vbmeta_payload_flags() {
         let events = backend.event_log();
         let mut session = mock_session(backend).await;
 
-        FlashConfig::new()
+        FlashRequest::new()
             .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
             .run(&mut session)
             .await
@@ -730,7 +730,7 @@ fn test_execute_decompresses_lz4_the_device_cannot_take() {
             let events = backend.event_log();
             let mut session = mock_session(backend).await;
 
-            FlashConfig::new()
+            FlashRequest::new()
                 .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
                 .run(&mut session)
                 .await
@@ -786,7 +786,7 @@ fn test_execute_with_local_pit_reports_once() {
 
         // The plan is checked against the local PIT and then rebuilt against the
         // flashed PIT, but informational messages must only be printed once
-        FlashConfig::new()
+        FlashRequest::new()
             .pit(Q7MQ_PIT)
             .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
             .skip(&["DTBO"])
@@ -804,11 +804,11 @@ fn test_execute_with_local_pit_reports_once() {
     assert_eq!(count, 1, "messages: {:?}", *messages);
 }
 
-/// Summarizes the images of a blueprint for comparisons.
+/// Summarizes the images of a prepared flash for comparisons.
 fn image_summary<P, I>(
-    blueprint: &FlashBlueprint<P, I>,
+    prepared: &PreparedFlash<P, I>,
 ) -> Vec<(String, u64, Option<u64>, Option<u32>)> {
-    blueprint
+    prepared
         .images
         .iter()
         .map(|planned| {
@@ -823,13 +823,13 @@ fn image_summary<P, I>(
 }
 
 #[test]
-fn test_preplan_is_deterministic_without_device() {
+fn test_prepare_is_deterministic_without_device() {
     let (vendor_lz4, _) = lz4_compress(&[0xAB; 4096]);
     let tar_bytes = build_tar(&[("boot.img", b"BOOT"), ("vendor.img.lz4", &vendor_lz4)]);
 
-    let preplan = || {
+    let prepare = || {
         futures::executor::block_on(
-            FlashConfig::new()
+            FlashRequest::new()
                 .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
                 .partitions([
                     (Some("12".to_string()), "a.img", Cursor::new(&b"A"[..])),
@@ -837,13 +837,13 @@ fn test_preplan_is_deterministic_without_device() {
                 ])
                 // Skip targets are only resolved against a PIT during execution
                 .skip(&["nonexistent"])
-                .preplan(),
+                .prepare(),
         )
         .unwrap()
     };
 
-    let summary = image_summary(&preplan());
-    assert_eq!(summary, image_summary(&preplan()));
+    let summary = image_summary(&prepare());
+    assert_eq!(summary, image_summary(&prepare()));
     assert_eq!(
         summary,
         [
@@ -861,22 +861,22 @@ fn test_preplan_is_deterministic_without_device() {
 }
 
 #[test]
-fn test_preplan_rejects_corrupt_lz4_regardless_of_skip() {
+fn test_prepare_rejects_corrupt_lz4_regardless_of_skip() {
     let tar_bytes = build_tar(&[("boot.img.lz4", &[0xFF; 64]), ("orphan.img.lz4", b"")]);
     let skips: [&[&str]; 3] = [&[], &["boot.img", "orphan.img"], &["BOOT"]];
     for skip in skips {
         let res = futures::executor::block_on(
-            FlashConfig::new()
+            FlashRequest::new()
                 .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
                 .skip(skip)
-                .preplan(),
+                .prepare(),
         );
         assert!(matches!(res, Err(FlashError::Lz4Header(name, _)) if name == "boot.img.lz4"));
     }
 
     // A corrupt image is rejected even if it would be overridden by a later one
     let res = futures::executor::block_on(
-        FlashConfig::new()
+        FlashRequest::new()
             .partitions([
                 (None, "boot.img.lz4", Cursor::new(&[0xFFu8; 64][..])),
                 (
@@ -885,32 +885,32 @@ fn test_preplan_rejects_corrupt_lz4_regardless_of_skip() {
                     Cursor::new(&b"BOOT"[..]),
                 ),
             ])
-            .preplan(),
+            .prepare(),
     );
     assert!(matches!(res, Err(FlashError::Lz4Header(name, _)) if name == "boot.img.lz4"));
 }
 
 #[test]
-fn test_preplan_rejects_invalid_inputs() {
+fn test_prepare_rejects_invalid_inputs() {
     let tar_bytes = build_tar(&[("boot.img", b"BOOT")]);
-    let preplan = |config: FlashConfig<Cursor<&[u8]>>| {
-        futures::executor::block_on(config.preplan()).map(|_| ())
+    let prepare = |request: FlashRequest<Cursor<&[u8]>>| {
+        futures::executor::block_on(request.prepare()).map(|_| ())
     };
 
-    let res = preplan(FlashConfig::new().sales_code(Some("TOOLONG")));
+    let res = prepare(FlashRequest::new().sales_code(Some("TOOLONG")));
     assert!(
         matches!(res, Err(FlashError::Odin(OdinError::InvalidSalesCode(code))) if code == "TOOLONG")
     );
 
-    let res = preplan(
-        FlashConfig::new()
+    let res = prepare(
+        FlashRequest::new()
             .pit(&b"invalid"[..])
             .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))]),
     );
     assert!(matches!(res, Err(FlashError::PitUnpackFailed(_))));
 
     let pit_tar = build_tar(&[("boot.img", b"BOOT"), ("device.pit", b"invalid")]);
-    let res = preplan(FlashConfig::new().packages([("CSC.tar", Cursor::new(pit_tar.as_slice()))]));
+    let res = prepare(FlashRequest::new().packages([("CSC.tar", Cursor::new(pit_tar.as_slice()))]));
     assert!(matches!(res, Err(FlashError::PitUnpackFailed(_))));
 
     let _guard = crate::progress::TEST_MUTEX
@@ -919,19 +919,19 @@ fn test_preplan_rejects_invalid_inputs() {
     let mut md5_tar = tar_bytes.clone();
     md5_tar.extend_from_slice(b"0123456789abcdef0123456789abcdef  AP.tar\n");
     let res =
-        preplan(FlashConfig::new().packages([("AP.tar.md5", Cursor::new(md5_tar.as_slice()))]));
+        prepare(FlashRequest::new().packages([("AP.tar.md5", Cursor::new(md5_tar.as_slice()))]));
     assert!(matches!(res, Err(FlashError::Md5VerificationFailed(name, _)) if name == "AP.tar.md5"));
 }
 
 #[test]
-fn test_preplan_inspects_super_images() {
+fn test_prepare_inspects_super_images() {
     let super_img = crate::firmware::lp::tests::build_test_raw_image(&[(2048, 0, 4096)]);
     let expected = crate::firmware::lp::inspect_super_bytes(&super_img);
     assert!(expected.is_some());
 
     let tar_bytes = build_tar(&[("super.img", &super_img)]);
-    let blueprint = futures::executor::block_on(
-        FlashConfig::new()
+    let prepared = futures::executor::block_on(
+        FlashRequest::new()
             .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
             .partitions([
                 (
@@ -941,10 +941,10 @@ fn test_preplan_inspects_super_images() {
                 ),
                 (Some("7".to_string()), "b.img", Cursor::new(&super_img[..])),
             ])
-            .preplan(),
+            .prepare(),
     )
     .unwrap();
-    let sizes: Vec<_> = blueprint.images.iter().map(|i| i.super_used_size).collect();
+    let sizes: Vec<_> = prepared.images.iter().map(|i| i.super_used_size).collect();
     // Partition IDs cannot be identified as super without a PIT
     assert_eq!(sizes, [expected, expected, None]);
 
@@ -953,14 +953,14 @@ fn test_preplan_inspects_super_images() {
         ("meta-data/super_used_size.txt", b"123\n"),
         ("super.img", &super_img),
     ]);
-    let blueprint = futures::executor::block_on(
-        FlashConfig::new()
+    let prepared = futures::executor::block_on(
+        FlashRequest::new()
             .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
-            .preplan(),
+            .prepare(),
     )
     .unwrap();
-    assert_eq!(blueprint.super_used_size, Some(123));
-    assert_eq!(blueprint.images[0].super_used_size, None);
+    assert_eq!(prepared.super_used_size, Some(123));
+    assert_eq!(prepared.images[0].super_used_size, None);
 }
 
 #[test]
@@ -970,27 +970,27 @@ fn test_super_used_size_inspects_partition_id_targets() {
     let super_id = find_entry(&pit_data, "SUPER").partition_id;
 
     futures::executor::block_on(async {
-        let mut blueprint = FlashConfig::new()
+        let mut prepared = FlashRequest::new()
             .partitions([(
                 Some(super_id.to_string()),
                 "super.img",
                 Cursor::new(&super_img[..]),
             )])
-            .preplan()
+            .prepare()
             .await
             .unwrap();
-        assert_eq!(blueprint.images[0].super_used_size, None);
+        assert_eq!(prepared.images[0].super_used_size, None);
 
-        let resolved = blueprint.resolve(&pit_data, true).await.unwrap();
+        let plan = prepared.resolve(&pit_data, true).await.unwrap();
         assert_eq!(
-            blueprint.super_used_size(&resolved).await,
+            prepared.super_used_size(&plan).await,
             crate::firmware::lp::inspect_super_bytes(&super_img)
         );
     });
 }
 
 #[test]
-fn test_blueprint_flashes_userdata() {
+fn test_prepared_flash_flashes_userdata() {
     let tar_bytes = build_tar(&[("boot.img", b"BOOT"), ("AP/userdata.img", b"DATA")]);
     let listed_tar = build_tar(&[
         ("meta-data/download-list.txt", b"boot.img\n"),
@@ -1004,11 +1004,11 @@ fn test_blueprint_flashes_userdata() {
     type Partitions<'a> = Vec<(Option<String>, &'a str, Cursor<&'a [u8]>)>;
     let flashes_userdata = |tar: &[u8], partitions: Partitions, skip: &[&str]| {
         futures::executor::block_on(
-            FlashConfig::new()
+            FlashRequest::new()
                 .packages([("AP.tar", Cursor::new(tar))])
                 .partitions(partitions)
                 .skip(skip)
-                .preplan(),
+                .prepare(),
         )
         .unwrap()
         .flashes_userdata()
@@ -1071,33 +1071,33 @@ fn test_resolve_last_writer_wins() {
             ]
         };
 
-        let mut blueprint = FlashConfig::new()
+        let mut prepared = FlashRequest::new()
             .packages(packages())
-            .preplan()
+            .prepare()
             .await
             .unwrap();
-        let resolved = blueprint.resolve(&pit_data, true).await.unwrap();
-        assert_eq!(resolved.payloads.len(), 1);
+        let plan = prepared.resolve(&pit_data, true).await.unwrap();
+        assert_eq!(plan.payloads.len(), 1);
         assert!(matches!(
-            resolved.payloads[0].image.source,
+            plan.payloads[0].image.source,
             ImageSource::Package { index: 1, .. }
         ));
 
         // Explicit partitions come after packages, so they win
-        let mut blueprint = FlashConfig::new()
+        let mut prepared = FlashRequest::new()
             .packages(packages())
             .partitions([(
                 Some(boot_name.clone()),
                 "my_boot.img",
                 Cursor::new(&b"MINE"[..]),
             )])
-            .preplan()
+            .prepare()
             .await
             .unwrap();
-        let resolved = blueprint.resolve(&pit_data, true).await.unwrap();
-        assert_eq!(resolved.payloads.len(), 1);
+        let plan = prepared.resolve(&pit_data, true).await.unwrap();
+        assert_eq!(plan.payloads.len(), 1);
         assert!(matches!(
-            resolved.payloads[0].image.source,
+            plan.payloads[0].image.source,
             ImageSource::Image { index: 0, .. }
         ));
     });
@@ -1108,12 +1108,12 @@ fn test_resolve_last_writer_wins() {
 fn test_phase_futures_are_send() {
     fn assert_send<T: Send>(_: &T) {}
 
-    let preplan = FlashConfig::new()
+    let prepare = FlashRequest::new()
         .packages([("AP.tar", Cursor::new(&b""[..]))])
-        .preplan();
-    assert_send(&preplan);
-    let _ = |blueprint: FlashBlueprint, session: &mut OdinSession| {
-        assert_send(&blueprint.execute(session));
+        .prepare();
+    assert_send(&prepare);
+    let _ = |prepared: PreparedFlash, session: &mut OdinSession| {
+        assert_send(&prepared.execute(session));
     };
 }
 
@@ -1128,15 +1128,15 @@ fn test_execute_sets_sales_code_after_resolving() {
             let events = backend.event_log();
             let mut session = mock_session(backend).await;
 
-            let mut config = FlashConfig::new()
+            let mut request = FlashRequest::new()
                 .sales_code(Some("XAA"))
                 .erase(true)
                 .skip(skip);
             if let Some(pit) = pit {
-                config = config.pit(pit);
+                request = request.pit(pit);
             }
             let packages = packages.then(|| ("AP.tar", Cursor::new(tar_bytes.as_slice())));
-            let res = config.packages(packages).run(&mut session).await;
+            let res = request.packages(packages).run(&mut session).await;
             let logged = events.lock().unwrap().clone();
             (res, logged)
         })

@@ -18,7 +18,7 @@ use crate::cli::FlashArgs;
 use crate::progress::CliProgress;
 use crate::session::connect;
 use samloader_odin::{
-    FlashConfig, UsbBackendOption,
+    FlashRequest, UsbBackendOption,
     futures::{executor::block_on, io::AllowStdIo},
     set_progress,
 };
@@ -91,7 +91,7 @@ pub(crate) fn run(
         None => None,
     };
 
-    let mut config = FlashConfig::new()
+    let mut request = FlashRequest::new()
         .reboot_mode(args.odin.reboot_mode())
         .skip_size_check(args.skip_size_check)
         .skip_md5(args.skip_md5)
@@ -104,14 +104,14 @@ pub(crate) fn run(
         .sales_code(args.csc_code.as_deref());
 
     if let Some(buffer) = pit_bytes {
-        config = config.pit(buffer);
+        request = request.pit(buffer);
     }
 
     // Validate and index the inputs before connecting to the device
     set_progress(CliProgress::new(verbose));
-    let blueprint = block_on(config.preplan())?;
+    let prepared = block_on(request.prepare())?;
 
-    if !args.force && blueprint.flashes_userdata() {
+    if !args.force && prepared.flashes_userdata() {
         if !io::stdin().is_terminal() {
             return Err(
                 "Flash list contains userdata, which will wipe the device's data. \
@@ -126,7 +126,7 @@ pub(crate) fn run(
 
     block_on(async {
         let mut session = connect(usb_backend, args.odin.wait).await?;
-        blueprint.execute(&mut session).await?;
+        prepared.execute(&mut session).await?;
         Ok(())
     })
 }

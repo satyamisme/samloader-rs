@@ -40,7 +40,7 @@ pub enum RebootMode {
     Download,
 }
 
-/// Options carried from a [`FlashConfig`] into execution.
+/// Options carried from a [`FlashRequest`] into execution.
 #[derive(Default)]
 struct FlashOptions {
     reboot_mode: RebootMode,
@@ -99,16 +99,16 @@ impl FlashOptions {
 
 /// Configures a flash operation. Building it performs no I/O.
 ///
-/// Call [`preplan`](Self::preplan) to read and validate the inputs, then
-/// [`FlashBlueprint::execute`] to flash a device.
-pub struct FlashConfig<P = Cursor<&'static [u8]>, I = Cursor<&'static [u8]>> {
+/// Call [`prepare`](Self::prepare) to read and validate the inputs, then
+/// [`PreparedFlash::execute`] to flash a device.
+pub struct FlashRequest<P = Cursor<&'static [u8]>, I = Cursor<&'static [u8]>> {
     options: FlashOptions,
     pit: Option<Vec<u8>>,
     readers: FirmwareReaders<P, I>,
 }
 
-impl FlashConfig {
-    /// Creates a new `FlashConfig` with default options and no inputs.
+impl FlashRequest {
+    /// Creates a new `FlashRequest` with default options and no inputs.
     pub fn new() -> Self {
         Self {
             options: FlashOptions::default(),
@@ -118,13 +118,13 @@ impl FlashConfig {
     }
 }
 
-impl Default for FlashConfig {
+impl Default for FlashRequest {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<P, I> FlashConfig<P, I> {
+impl<P, I> FlashRequest<P, I> {
     /// Sets whether to perform a low-level NAND hardware erase on the `USERDATA` partition
     /// prior to flashing or as a standalone wipe operation.
     pub fn erase(mut self, enabled: bool) -> Self {
@@ -167,8 +167,8 @@ impl<P, I> FlashConfig<P, I> {
     pub fn packages<S: Into<String>, R>(
         self,
         packages: impl IntoIterator<Item = (S, R)>,
-    ) -> FlashConfig<R, I> {
-        FlashConfig {
+    ) -> FlashRequest<R, I> {
+        FlashRequest {
             options: self.options,
             pit: self.pit,
             readers: FirmwareReaders {
@@ -185,8 +185,8 @@ impl<P, I> FlashConfig<P, I> {
     pub fn partitions<S: Into<String>, R>(
         self,
         partitions: impl IntoIterator<Item = (Option<String>, S, R)>,
-    ) -> FlashConfig<P, R> {
-        FlashConfig {
+    ) -> FlashRequest<P, R> {
+        FlashRequest {
             options: self.options,
             pit: self.pit,
             readers: FirmwareReaders {
@@ -237,15 +237,15 @@ impl<P, I> FlashConfig<P, I> {
     }
 }
 
-impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashConfig<P, I> {
+impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashRequest<P, I> {
     /// Reads and validates all inputs without a device or PIT.
     ///
     /// This verifies MD5 footers, indexes the packages, parses the LZ4 header of
     /// every LZ4 compressed image, and inspects super images. A local PIT is
     /// checked to be valid, but not used. The result only depends on the inputs
     /// and options, as matching images to partitions, including skips, needs the
-    /// device's PIT and happens in [`FlashBlueprint::execute`].
-    pub async fn preplan(self) -> Result<FlashBlueprint<P, I>, FlashError> {
+    /// device's PIT and happens in [`PreparedFlash::execute`].
+    pub async fn prepare(self) -> Result<PreparedFlash<P, I>, FlashError> {
         let Self {
             options,
             pit,
@@ -258,7 +258,7 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashCo
 
         if readers.is_empty() && pit.is_none() {
             options.warn_unused();
-            return Ok(FlashBlueprint {
+            return Ok(PreparedFlash {
                 options,
                 pit,
                 readers,
@@ -335,7 +335,7 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashCo
             }
         }
 
-        Ok(FlashBlueprint {
+        Ok(PreparedFlash {
             options,
             pit,
             readers,
@@ -384,9 +384,9 @@ impl PlannedImage {
     }
 }
 
-/// A flash prepared from a [`FlashConfig`], holding everything that can be
-/// determined without a device or PIT. Created by [`FlashConfig::preplan`].
-pub struct FlashBlueprint<P = Cursor<&'static [u8]>, I = Cursor<&'static [u8]>> {
+/// A flash prepared from a [`FlashRequest`], holding everything that can be
+/// determined without a device or PIT. Created by [`FlashRequest::prepare`].
+pub struct PreparedFlash<P = Cursor<&'static [u8]>, I = Cursor<&'static [u8]>> {
     options: FlashOptions,
     /// PIT to flash, given explicitly or found in a package.
     pit: Option<Vec<u8>>,
@@ -398,7 +398,7 @@ pub struct FlashBlueprint<P = Cursor<&'static [u8]>, I = Cursor<&'static [u8]>> 
     has_download_list: bool,
 }
 
-impl<P, I> FlashBlueprint<P, I> {
+impl<P, I> PreparedFlash<P, I> {
     /// Returns whether the flash writes the userdata partition, which wipes the
     /// device's data. As the device's PIT is not consulted, this is a name-based
     /// check meant for confirmation prompts before connecting to a device, which
@@ -468,23 +468,23 @@ impl FirmwarePartitionPayload<'_> {
     }
 }
 
-/// A blueprint resolved against a PIT.
+/// The device-specific plan: a prepared flash resolved against a PIT.
 #[derive(Default)]
-struct Resolved<'p> {
+struct FlashPlan<'p> {
     payloads: Vec<FirmwarePartitionPayload<'p>>,
-    /// Index into `FlashBlueprint::images` of each payload.
+    /// Index into `PreparedFlash::images` of each payload.
     image_indices: Vec<usize>,
     /// Whether a super partition is excluded with a skip target.
     super_skipped: bool,
 }
 
-impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashBlueprint<P, I> {
-    /// Resolves the blueprint against the device's PIT, then flashes the device
+impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> PreparedFlash<P, I> {
+    /// Resolves the flash against the device's PIT, then flashes the device
     /// behind `session`.
     ///
-    /// With a local PIT, the blueprint is first resolved against it to catch
+    /// With a local PIT, the flash is first resolved against it to catch
     /// errors before the PIT is flashed. Nothing is written to the device, not
-    /// even the CSC, before the blueprint has been resolved.
+    /// even the CSC, before the flash has been resolved.
     pub async fn execute(mut self, session: &mut OdinSession) -> Result<(), FlashError> {
         if self.is_empty() {
             self.prepare_device(session).await?;
@@ -513,13 +513,13 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashBl
         progress::println("Downloading device's PIT file");
         let pit_buffer = session.receive_pit_info().await?;
         let device_pit = PitData::new(&pit_buffer).map_err(FlashError::PitUnpackFailed)?;
-        let resolved = self.resolve(&device_pit, true).await?;
+        let plan = self.resolve(&device_pit, true).await?;
         if local_pit.is_none() {
             self.prepare_device(session).await?;
         }
 
-        let super_used_size = self.super_used_size(&resolved).await;
-        self.flash(session, resolved, super_used_size).await
+        let super_used_size = self.super_used_size(&plan).await;
+        self.flash(session, plan, super_used_size).await
     }
 
     /// Sets the CSC and erases the device as configured. These are the first writes
@@ -542,7 +542,7 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashBl
         &mut self,
         pit_data: &'p PitData,
         report: bool,
-    ) -> Result<Resolved<'p>, FlashError> {
+    ) -> Result<FlashPlan<'p>, FlashError> {
         let skipped_ids = self.options.skipped_partition_ids(pit_data)?;
 
         // 1. Match each image to a PIT entry
@@ -600,7 +600,7 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashBl
         });
 
         // 4. Validate sizes
-        let mut resolved = Resolved {
+        let mut plan = FlashPlan {
             super_skipped: pit_data
                 .entries
                 .iter()
@@ -617,16 +617,15 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashBl
                     ));
                 }
             }
-            resolved
-                .payloads
+            plan.payloads
                 .push(FirmwarePartitionPayload { pit_entry, image });
-            resolved.image_indices.push(index);
+            plan.image_indices.push(index);
         }
 
-        self.rewrite_vbmeta_payloads(pit_data, &mut resolved.payloads, report)
+        self.rewrite_vbmeta_payloads(pit_data, &mut plan.payloads, report)
             .await?;
 
-        Ok(resolved)
+        Ok(plan)
     }
 
     // Set the requested AVB flags in vbmeta payloads. Like fastboot, the top-level
@@ -701,22 +700,22 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashBl
 
     /// Determines the super partition size to check against the device. The value
     /// from `super_used_size.txt` takes precedence over inspecting the super image.
-    async fn super_used_size(&mut self, resolved: &Resolved<'_>) -> Option<u32> {
-        if resolved.super_skipped {
+    async fn super_used_size(&mut self, plan: &FlashPlan<'_>) -> Option<u32> {
+        if plan.super_skipped {
             return None;
         }
         if self.super_used_size.is_some() {
             return self.super_used_size;
         }
 
-        let (payload, &index) = resolved
+        let (payload, &index) = plan
             .payloads
             .iter()
-            .zip(&resolved.image_indices)
+            .zip(&plan.image_indices)
             .find(|(payload, _)| payload.pit_entry.is_super())?;
         let planned = &self.images[index];
         if planned.target.is_super() {
-            // Already inspected while pre-planning
+            // Already inspected while preparing
             return planned.super_used_size;
         }
         payload.image.super_used_size(&mut self.readers).await
@@ -727,10 +726,10 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashBl
     async fn flash(
         &mut self,
         session: &mut OdinSession,
-        resolved: Resolved<'_>,
+        plan: FlashPlan<'_>,
         super_used_size: Option<u32>,
     ) -> Result<(), FlashError> {
-        let total_bytes: u64 = resolved
+        let total_bytes: u64 = plan
             .payloads
             .iter()
             .map(|p| p.image.uncompressed_size())
@@ -754,7 +753,7 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashBl
                 .map_err(FlashError::SuperSizeCheckFailed)?;
         }
 
-        for planned in resolved.payloads {
+        for planned in plan.payloads {
             let name = planned.pit_entry.partition_name.to_string_lossy();
             let partition_size = planned.image.uncompressed_size();
 
