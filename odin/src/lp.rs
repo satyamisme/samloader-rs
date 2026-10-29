@@ -205,10 +205,10 @@ fn parse_lp_metadata(raw: &[u8]) -> Option<u32> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn build_test_raw_image(extents: &[(u64, u32, u64)]) -> Vec<u8> {
+    pub(crate) fn build_test_raw_image(extents: &[(u64, u32, u64)]) -> Vec<u8> {
         let mut raw = vec![0u8; 128 * 1024];
 
         // Geometry at 0x1000

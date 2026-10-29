@@ -17,11 +17,11 @@
 use crate::FlashError;
 use crate::avb;
 use crate::firmware::{
-    FirmwareImage, FirmwarePartitionPayload, FirmwarePartitionSource, PackageEntry, PackageIndex,
+    FirmwareImage, FirmwarePartitionPayload, FirmwarePartitionSource, PackageIndex,
     normalize_basename, verify_md5_footer,
 };
 use crate::lp::inspect_super_partition;
-use crate::odin::OdinSession;
+use crate::odin::{OdinSession, parse_sales_code};
 use crate::progress::{self, FlashEvent};
 use futures::io::{AsyncRead, AsyncSeek, AsyncSeekExt, Cursor};
 use samloader_pit::{PitData, PitEntry};
@@ -138,40 +138,54 @@ pub enum RebootMode {
     Download,
 }
 
-/// Configures a flash operation, processing package and partition sources and
-/// executing the Loke flash protocol. Building it performs no I/O.
-pub struct FlashConfig<P = Cursor<&'static [u8]>, I = Cursor<&'static [u8]>> {
-    pit_file_bytes: Option<Vec<u8>>,
-
+/// Options carried from a [`FlashConfig`] into execution.
+#[derive(Default)]
+struct FlashOptions {
     reboot_mode: RebootMode,
     skip_size_check: bool,
     skip_md5: bool,
-    packages: Vec<(String, P)>,
-    partitions: Vec<(Option<String>, String, I)>,
-    super_used_size: Option<u32>,
-    has_download_list: bool,
     sales_code: Option<String>,
     erase: bool,
     skip: Vec<String>,
     vbmeta_flags: u32,
 }
 
+impl FlashOptions {
+    /// Warns about options that only apply when partitions are flashed.
+    fn warn_unused(&self) {
+        if !self.skip.is_empty() {
+            progress::println("Warning: --skip ignored when no partitions are flashed");
+        }
+        if self.vbmeta_flags & avb::AVB_VBMETA_IMAGE_FLAGS_HASHTREE_DISABLED != 0 {
+            progress::println("Warning: --disable-verity ignored when no partitions are flashed");
+        }
+        if self.vbmeta_flags & avb::AVB_VBMETA_IMAGE_FLAGS_VERIFICATION_DISABLED != 0 {
+            progress::println(
+                "Warning: --disable-verification ignored when no partitions are flashed",
+            );
+        }
+    }
+}
+
+/// Configures a flash operation. Building it performs no I/O.
+///
+/// Call [`preplan`](Self::preplan) to read and validate the inputs, then
+/// [`FlashBlueprint::execute`] to flash a device.
+pub struct FlashConfig<P = Cursor<&'static [u8]>, I = Cursor<&'static [u8]>> {
+    options: FlashOptions,
+    pit: Option<Vec<u8>>,
+    packages: Vec<(String, P)>,
+    partitions: Vec<(Option<String>, String, I)>,
+}
+
 impl FlashConfig {
     /// Creates a new `FlashConfig` with default options and no inputs.
     pub fn new() -> Self {
         Self {
-            pit_file_bytes: None,
-            reboot_mode: RebootMode::None,
-            skip_size_check: false,
-            skip_md5: false,
+            options: FlashOptions::default(),
+            pit: None,
             packages: Vec::new(),
             partitions: Vec::new(),
-            super_used_size: None,
-            has_download_list: false,
-            sales_code: None,
-            erase: false,
-            skip: Vec::new(),
-            vbmeta_flags: 0,
         }
     }
 }
@@ -186,37 +200,38 @@ impl<P, I> FlashConfig<P, I> {
     /// Sets whether to perform a low-level NAND hardware erase on the `USERDATA` partition
     /// prior to flashing or as a standalone wipe operation.
     pub fn erase(mut self, enabled: bool) -> Self {
-        self.erase = enabled;
+        self.options.erase = enabled;
         self
     }
 
     /// Sets an optional 3-letter CSC / Sales Code to configure on the device.
     pub fn sales_code(mut self, sales_code: Option<&str>) -> Self {
-        self.sales_code = sales_code.map(str::to_owned);
+        self.options.sales_code = sales_code.map(str::to_owned);
         self
     }
 
     /// Sets the reboot mode to perform after flashing completes.
     pub fn reboot_mode(mut self, mode: RebootMode) -> Self {
-        self.reboot_mode = mode;
+        self.options.reboot_mode = mode;
         self
     }
 
     /// Sets whether to skip partition size checks.
     pub fn skip_size_check(mut self, enabled: bool) -> Self {
-        self.skip_size_check = enabled;
+        self.options.skip_size_check = enabled;
         self
     }
 
     /// Sets whether to skip MD5 package verification.
     pub fn skip_md5(mut self, enabled: bool) -> Self {
-        self.skip_md5 = enabled;
+        self.options.skip_md5 = enabled;
         self
     }
 
-    /// Sets an explicit PIT payload.
+    /// Sets an explicit PIT payload to flash. Without one, a PIT found in a
+    /// package is flashed.
     pub fn pit(mut self, pit_bytes: impl Into<Vec<u8>>) -> Self {
-        self.pit_file_bytes = Some(pit_bytes.into());
+        self.pit = Some(pit_bytes.into());
         self
     }
 
@@ -226,21 +241,13 @@ impl<P, I> FlashConfig<P, I> {
         packages: impl IntoIterator<Item = (S, R)>,
     ) -> FlashConfig<R, I> {
         FlashConfig {
-            pit_file_bytes: self.pit_file_bytes,
-            reboot_mode: self.reboot_mode,
-            skip_size_check: self.skip_size_check,
-            skip_md5: self.skip_md5,
+            options: self.options,
+            pit: self.pit,
             packages: packages
                 .into_iter()
                 .map(|(name, reader)| (name.into(), reader))
                 .collect(),
             partitions: self.partitions,
-            super_used_size: self.super_used_size,
-            has_download_list: self.has_download_list,
-            sales_code: self.sales_code,
-            erase: self.erase,
-            skip: self.skip,
-            vbmeta_flags: self.vbmeta_flags,
         }
     }
 
@@ -250,21 +257,13 @@ impl<P, I> FlashConfig<P, I> {
         partitions: impl IntoIterator<Item = (Option<String>, S, R)>,
     ) -> FlashConfig<P, R> {
         FlashConfig {
-            pit_file_bytes: self.pit_file_bytes,
-            reboot_mode: self.reboot_mode,
-            skip_size_check: self.skip_size_check,
-            skip_md5: self.skip_md5,
+            options: self.options,
+            pit: self.pit,
             packages: self.packages,
             partitions: partitions
                 .into_iter()
                 .map(|(part, name, reader)| (part, name.into(), reader))
                 .collect(),
-            super_used_size: self.super_used_size,
-            has_download_list: self.has_download_list,
-            sales_code: self.sales_code,
-            erase: self.erase,
-            skip: self.skip,
-            vbmeta_flags: self.vbmeta_flags,
         }
     }
 
@@ -272,7 +271,7 @@ impl<P, I> FlashConfig<P, I> {
     /// or a partition name in the PIT. Partition names also exclude their `_A` and `_B`
     /// slots.
     pub fn skip(mut self, targets: &[impl AsRef<str>]) -> Self {
-        self.skip = targets
+        self.options.skip = targets
             .iter()
             .map(|t| t.as_ref().trim().to_string())
             .filter(|t| !t.is_empty())
@@ -299,41 +298,231 @@ impl<P, I> FlashConfig<P, I> {
 
     fn set_vbmeta_flag(&mut self, flag: u32, enabled: bool) {
         if enabled {
-            self.vbmeta_flags |= flag;
+            self.options.vbmeta_flags |= flag;
         } else {
-            self.vbmeta_flags &= !flag;
+            self.options.vbmeta_flags &= !flag;
         }
     }
 }
 
 impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashConfig<P, I> {
-    /// Executes the flashing pipeline sequence on the device behind `session`.
-    pub async fn execute(&mut self, session: &mut OdinSession) -> Result<(), FlashError> {
-        // Step 0: Set device sales code if configured
-        if let Some(sales_code) = &self.sales_code {
+    /// Reads and validates all inputs without a device or PIT.
+    ///
+    /// This verifies MD5 footers, indexes the packages, parses the LZ4 header of
+    /// every LZ4 compressed image, and inspects super images. A local PIT is
+    /// checked to be valid, but not used. The result only depends on the inputs
+    /// and options, as matching images to partitions, including skips, needs the
+    /// device's PIT and happens in [`FlashBlueprint::execute`].
+    pub async fn preplan(self) -> Result<FlashBlueprint<P, I>, FlashError> {
+        let Self {
+            options,
+            pit,
+            mut packages,
+            mut partitions,
+        } = self;
+
+        if let Some(sales_code) = &options.sales_code {
+            parse_sales_code(sales_code)?;
+        }
+
+        if packages.is_empty() && partitions.is_empty() && pit.is_none() {
+            options.warn_unused();
+            return Ok(FlashBlueprint {
+                options,
+                pit,
+                packages,
+                partitions,
+                images: Vec::new(),
+                super_used_size: None,
+                has_download_list: false,
+            });
+        }
+
+        if !options.skip_md5 {
+            for (name, reader) in &mut packages {
+                if name.to_lowercase().ends_with(".md5") {
+                    verify_md5_footer(&mut *reader, name)
+                        .await
+                        .map_err(|e| FlashError::Md5VerificationFailed(name.clone(), e))?;
+                }
+            }
+        }
+
+        let index = PackageIndex::scan(&mut packages, pit.is_none()).await?;
+        let pit = pit.or(index.pit_bytes);
+        if let Some(pit_bytes) = &pit {
+            PitData::new(pit_bytes).map_err(FlashError::PitUnpackFailed)?;
+        }
+
+        let mut images = Vec::with_capacity(index.entries.len() + partitions.len());
+        for entry in index.entries {
+            let source = FirmwarePartitionSource::Package {
+                index: entry.package_index,
+                offset: entry.offset,
+                size: entry.size,
+            };
+            let image =
+                FirmwareImage::inspect(source, entry.is_lz4, &mut packages, &mut partitions)
+                    .await
+                    .map_err(|e| FlashError::Lz4Header(entry.original_name.clone(), e))?;
+            images.push(PlannedImage {
+                target: Target::File(entry.normalized_name),
+                display_name: entry.original_name,
+                image,
+                super_used_size: None,
+            });
+        }
+
+        for index in 0..partitions.len() {
+            let (part_name, filename, reader) = &mut partitions[index];
+            let (normalized_name, is_lz4) = normalize_basename(filename);
+            let target = match part_name {
+                None => Target::File(normalized_name),
+                Some(name) => match name.parse::<u32>() {
+                    Ok(id) => Target::PartitionId(id),
+                    Err(_) => Target::Partition(name.clone()),
+                },
+            };
+            let display_name = filename.clone();
+            let size = reader
+                .seek(SeekFrom::End(0))
+                .await
+                .map_err(|e| FlashError::FileReadFailed(display_name.clone(), e))?;
+            let source = FirmwarePartitionSource::Image { index, size };
+            let image = FirmwareImage::inspect(source, is_lz4, &mut packages, &mut partitions)
+                .await
+                .map_err(|e| FlashError::Lz4Header(display_name.clone(), e))?;
+            images.push(PlannedImage {
+                target,
+                display_name,
+                image,
+                super_used_size: None,
+            });
+        }
+
+        if index.super_used_size.is_none() {
+            for planned in images.iter_mut().filter(|i| i.target.is_super()) {
+                planned.super_used_size =
+                    inspect_super_image(&planned.image, &mut packages, &mut partitions).await;
+            }
+        }
+
+        Ok(FlashBlueprint {
+            options,
+            pit,
+            packages,
+            partitions,
+            images,
+            super_used_size: index.super_used_size,
+            has_download_list: index.has_download_list,
+        })
+    }
+}
+
+/// How an image is matched to a PIT entry during execution.
+#[derive(Debug, PartialEq)]
+enum Target {
+    /// Flash file name in the PIT, with any directory and `.lz4` suffix stripped.
+    File(String),
+    /// Explicit partition name, e.g. `-p BOOT boot.img`.
+    Partition(String),
+    /// Explicit partition ID, e.g. `-p 12 boot.img`.
+    PartitionId(u32),
+}
+
+impl Target {
+    /// Whether the target is known to be the super partition without a PIT.
+    fn is_super(&self) -> bool {
+        match self {
+            Self::File(name) => name.eq_ignore_ascii_case("super.img"),
+            Self::Partition(name) => name.eq_ignore_ascii_case("SUPER"),
+            Self::PartitionId(_) => false,
+        }
+    }
+}
+
+/// An input image collected without a PIT.
+struct PlannedImage {
+    target: Target,
+    display_name: String,
+    image: FirmwareImage,
+    /// LP metadata size of the image, if it targets the super partition.
+    super_used_size: Option<u32>,
+}
+
+impl PlannedImage {
+    /// Whether the image is a standalone file rather than a package entry.
+    fn is_standalone(&self) -> bool {
+        matches!(self.image.source, FirmwarePartitionSource::Image { .. })
+    }
+}
+
+/// A flash prepared from a [`FlashConfig`], holding everything that can be
+/// determined without a device or PIT. Created by [`FlashConfig::preplan`].
+pub struct FlashBlueprint<P = Cursor<&'static [u8]>, I = Cursor<&'static [u8]>> {
+    options: FlashOptions,
+    /// PIT to flash, given explicitly or found in a package.
+    pit: Option<Vec<u8>>,
+    packages: Vec<(String, P)>,
+    partitions: Vec<(Option<String>, String, I)>,
+    /// Package entries in order, followed by standalone files.
+    images: Vec<PlannedImage>,
+    /// Value of `super_used_size.txt`, if present.
+    super_used_size: Option<u32>,
+    has_download_list: bool,
+}
+
+impl<P, I> FlashBlueprint<P, I> {
+    /// Returns whether the flash writes the userdata partition, which wipes the
+    /// device's data. As the device's PIT is not consulted, this is a name-based
+    /// check meant for confirmation prompts before connecting to a device, which
+    /// honors the configured skip targets. Partitions given by numeric ID cannot
+    /// be resolved.
+    pub fn flashes_userdata(&self) -> bool {
+        let names: Vec<&str> = self
+            .images
+            .iter()
+            .filter_map(|planned| match &planned.target {
+                Target::File(name) | Target::Partition(name) => Some(name.as_str()),
+                Target::PartitionId(_) => None,
+            })
+            .collect();
+        flashes_userdata(&names, &self.options.skip)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.packages.is_empty() && self.partitions.is_empty() && self.pit.is_none()
+    }
+}
+
+/// A blueprint resolved against a PIT.
+#[derive(Default)]
+struct Resolved<'p> {
+    payloads: Vec<FirmwarePartitionPayload<'p>>,
+    /// Index into `FlashBlueprint::images` of each payload.
+    image_indices: Vec<usize>,
+    /// Whether a super partition is excluded with a skip target.
+    super_skipped: bool,
+}
+
+impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashBlueprint<P, I> {
+    /// Resolves the blueprint against the device's PIT, then flashes the device
+    /// behind `session`.
+    ///
+    /// With a local PIT, the blueprint is first resolved against it to catch
+    /// errors before the PIT is flashed. Nothing destructive happens before the
+    /// blueprint has been resolved.
+    pub async fn execute(mut self, session: &mut OdinSession) -> Result<(), FlashError> {
+        if let Some(sales_code) = &self.options.sales_code {
             progress::println(&format!("Setting device sales code to {}...", sales_code));
             session.set_sales_code(sales_code).await?;
         }
 
-        // If no packages, partitions, or explicit PIT are specified, complete session and return
-        if self.packages.is_empty() && self.partitions.is_empty() && self.pit_file_bytes.is_none() {
-            if !self.skip.is_empty() {
-                progress::println("Warning: --skip ignored when no partitions are flashed");
-            }
-            if self.vbmeta_flags & avb::AVB_VBMETA_IMAGE_FLAGS_HASHTREE_DISABLED != 0 {
-                progress::println(
-                    "Warning: --disable-verity ignored when no partitions are flashed",
-                );
-            }
-            if self.vbmeta_flags & avb::AVB_VBMETA_IMAGE_FLAGS_VERIFICATION_DISABLED != 0 {
-                progress::println(
-                    "Warning: --disable-verification ignored when no partitions are flashed",
-                );
-            }
-            if self.erase {
+        if self.is_empty() {
+            if self.options.erase {
                 session.nand_erase().await?;
             }
-            match self.reboot_mode {
+            match self.options.reboot_mode {
                 RebootMode::Normal => session.reboot_device().await?,
                 RebootMode::Download => session.reboot_to_download().await?,
                 RebootMode::None => session.end_session().await?,
@@ -341,249 +530,91 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashCo
             return Ok(());
         }
 
-        // Step 1: Verify MD5 footers and scan TAR containers to index entries
-        self.verify_packages().await?;
-        let entries = self.scan_tar_packages().await?;
+        let device_pit;
+        let resolved = if let Some(pit_bytes) = self.pit.take() {
+            let local_pit = PitData::new(&pit_bytes).map_err(FlashError::PitUnpackFailed)?;
+            self.resolve(&local_pit, false).await?;
 
-        // Step 2: Plan against a PIT before anything destructive happens on the device.
-        // With a local PIT, the plan is checked against it, then rebuilt against the
-        // PIT read back from the device after flashing. Otherwise the device PIT is
-        // read before the NAND erase, which does not modify it.
-        let flashes_pit = self.pit_file_bytes.is_some();
-        let planning_pit;
-        let mut flashed_pit = None;
-
-        let planned_partitions = if flashes_pit {
-            planning_pit = self.parse_local_pit()?;
-            self.plan_partitions(&planning_pit, &entries, false).await?;
-
-            if self.erase {
+            if self.options.erase {
                 session.nand_erase().await?;
             }
 
-            let pit_bytes = self.pit_file_bytes.as_ref().unwrap();
             progress::println("Flashing PIT");
-            session.send_pit_info(pit_bytes).await?;
+            session.send_pit_info(&pit_bytes).await?;
             progress::println("PIT flash successful\n");
 
-            let downloaded = Self::download_pit(session).await?;
-            let pit_ref = flashed_pit.insert(downloaded);
-            self.plan_partitions(pit_ref, &entries, true).await?
+            device_pit = download_pit(session).await?;
+            self.resolve(&device_pit, true).await?
         } else {
-            let downloaded = Self::download_pit(session).await?;
-            let pit_ref = flashed_pit.insert(downloaded);
-            let planned = self.plan_partitions(pit_ref, &entries, true).await?;
+            device_pit = download_pit(session).await?;
+            let resolved = self.resolve(&device_pit, true).await?;
 
-            if self.erase {
+            if self.options.erase {
                 session.nand_erase().await?;
             }
-            planned
+            resolved
         };
 
-        // Auto-detect super_used_size if not specified in TAR metadata
-        if self.super_used_size.is_none()
-            && let Some(super_part) = planned_partitions
-                .iter()
-                .find(|p| is_super_entry(p.pit_entry))
-            && let Ok(mut reader) = super_part
-                .image
-                .source
-                .open_reader(&mut self.packages, &mut self.partitions)
-                .await
-        {
-            self.super_used_size = inspect_super_partition(&super_part.image, &mut reader).await;
-        }
-
-        // Step 3: Flash payloads to the device
-        self.flash_partitions(session, planned_partitions, self.reboot_mode)
-            .await?;
-
-        Ok(())
+        let super_used_size = self.super_used_size(&resolved).await;
+        self.flash(session, resolved, super_used_size).await
     }
 
-    // Helper 1: Optionally verify MD5 footers on TAR packages
-    async fn verify_packages(&mut self) -> Result<(), FlashError> {
-        if self.skip_md5 {
-            return Ok(());
-        }
-
-        for (name, reader) in &mut self.packages {
-            if name.to_lowercase().ends_with(".md5") {
-                verify_md5_footer(&mut *reader, name)
-                    .await
-                    .map_err(|e| FlashError::Md5VerificationFailed(name.clone(), e))?;
-            }
-        }
-
-        Ok(())
-    }
-
-    // Helper 2: Scan TAR packages to find resolved entries and pull package PIT if needed
-    async fn scan_tar_packages(&mut self) -> Result<Vec<PackageEntry>, FlashError> {
-        let want_pit = self.pit_file_bytes.is_none();
-        let scan = PackageIndex::scan(&mut self.packages, want_pit).await?;
-        if scan.has_download_list {
-            self.has_download_list = true;
-        }
-        if self.super_used_size.is_none() {
-            self.super_used_size = scan.super_used_size;
-        }
-        if self.pit_file_bytes.is_none() {
-            self.pit_file_bytes = scan.pit_bytes;
-        }
-        Ok(scan.entries)
-    }
-
-    // Helper 3: Parse local PIT file bytes
-    fn parse_local_pit(&self) -> Result<PitData, FlashError> {
-        let pit_bytes = self.pit_file_bytes.as_ref().unwrap();
-        PitData::new(pit_bytes).map_err(FlashError::PitUnpackFailed)
-    }
-
-    // Helper 4: Download active PIT data from device
-    async fn download_pit(session: &mut OdinSession) -> Result<PitData, FlashError> {
-        progress::println("Downloading device's PIT file");
-        let pit_buffer = session.receive_pit_info().await?;
-        let pit_data = PitData::new(&pit_buffer).map_err(FlashError::PitUnpackFailed)?;
-        Ok(pit_data)
-    }
-
-    // Helper 5: Plan partitions against a given PIT
-    async fn plan_partitions<'c>(
+    /// Matches images to the entries of `pit_data`, applies overrides, skips and
+    /// size checks, and rewrites vbmeta images. Reading vbmeta images is the only
+    /// input I/O.
+    async fn resolve<'p>(
         &mut self,
-        pit_data: &'c PitData,
-        entries: &[PackageEntry],
+        pit_data: &'p PitData,
         report: bool,
-    ) -> Result<Vec<FirmwarePartitionPayload<'c>>, FlashError> {
-        let skipped_ids = self.resolve_skipped_partitions(pit_data)?;
+    ) -> Result<Resolved<'p>, FlashError> {
+        let skipped_ids = resolve_skipped_partitions(&self.options.skip, pit_data)?;
 
-        // The super size check is meaningless when super is not flashed
-        if pit_data
-            .entries
-            .iter()
-            .any(|e| skipped_ids.contains(&e.partition_id) && is_super_entry(e))
-        {
-            self.super_used_size = None;
-        }
-
-        let mut planned_partitions = self
-            .build_partition_infos(pit_data, entries, &skipped_ids, report)
-            .await?;
-
-        self.rewrite_vbmeta_payloads(pit_data, &mut planned_partitions, report)
-            .await?;
-
-        Ok(planned_partitions)
-    }
-
-    // Helper 6: Resolve skip targets into the IDs of the PIT entries they match
-    fn resolve_skipped_partitions(&self, pit_data: &PitData) -> Result<HashSet<u32>, FlashError> {
-        let mut skipped_ids = HashSet::new();
-        for target in &self.skip {
-            let mut matched = false;
-            for entry in &pit_data.entries {
-                if is_skip_target(entry, target) {
-                    skipped_ids.insert(entry.partition_id);
-                    matched = true;
-                }
-            }
-            if !matched {
-                return Err(FlashError::SkipTargetNotFound(target.clone()));
-            }
-        }
-        Ok(skipped_ids)
-    }
-
-    // Helper 7: Resolve package entries and standalone files into FirmwarePartitionPayload items
-    async fn build_partition_infos<'c>(
-        &mut self,
-        pit_data: &'c PitData,
-        resolved_entries: &[PackageEntry],
-        skipped_ids: &HashSet<u32>,
-        report: bool,
-    ) -> Result<Vec<FirmwarePartitionPayload<'c>>, FlashError> {
-        enum CandidateSource {
-            Archive(PackageEntry),
-            Standalone { index: usize, is_lz4: bool },
-        }
-
-        struct Candidate<'pit> {
-            pit_entry: &'pit PitEntry,
-            source: CandidateSource,
-        }
-
-        let mut candidates = Vec::new();
-
-        // 1. Collect candidate entries from TAR packages
-        for entry in resolved_entries {
-            let Some(pit_entry) = find_pit_entry_by_filename(pit_data, &entry.normalized_name)
-            else {
-                if report {
-                    progress::println(&format!(
-                        "Skipping orphan file \"{}\" (no matching partition in PIT)",
-                        entry.original_name
-                    ));
-                }
-                continue;
-            };
-
-            candidates.push(Candidate {
-                pit_entry,
-                source: CandidateSource::Archive(entry.clone()),
-            });
-        }
-
-        // 2. Collect candidate individual files
-        for (index, (part_name, part_filename, _)) in self.partitions.iter().enumerate() {
-            let (filename, is_lz4_suffix) = normalize_basename(part_filename);
-            let entry = match part_name {
-                None => {
-                    let Some(entry) = find_pit_entry_by_filename(pit_data, &filename) else {
-                        return Err(FlashError::PartitionNotFound(part_filename.clone()));
-                    };
-                    entry
-                }
-                Some(name) => {
-                    if let Ok(id) = name.parse::<u32>() {
-                        let Some(entry) = pit_data.find_entry_by_id(id) else {
-                            return Err(FlashError::PartitionIdNotFound(id));
-                        };
-                        entry
-                    } else {
-                        let Some(entry) = pit_data.find_entry_by_name(name) else {
-                            return Err(FlashError::PartitionNotFound(name.clone()));
-                        };
-                        entry
+        // 1. Match each image to a PIT entry
+        let mut candidates = Vec::with_capacity(self.images.len());
+        for (index, planned) in self.images.iter().enumerate() {
+            let pit_entry = match &planned.target {
+                Target::File(name) => match find_pit_entry_by_filename(pit_data, name) {
+                    Some(entry) => entry,
+                    None if planned.is_standalone() => {
+                        return Err(FlashError::PartitionNotFound(planned.display_name.clone()));
                     }
-                }
-            };
-
-            candidates.push(Candidate {
-                pit_entry: entry,
-                source: CandidateSource::Standalone {
-                    index,
-                    is_lz4: is_lz4_suffix,
+                    None => {
+                        if report {
+                            progress::println(&format!(
+                                "Skipping orphan file \"{}\" (no matching partition in PIT)",
+                                planned.display_name
+                            ));
+                        }
+                        continue;
+                    }
                 },
-            });
+                Target::Partition(name) => pit_data
+                    .find_entry_by_name(name)
+                    .ok_or_else(|| FlashError::PartitionNotFound(name.clone()))?,
+                Target::PartitionId(id) => pit_data
+                    .find_entry_by_id(*id)
+                    .ok_or(FlashError::PartitionIdNotFound(*id))?,
+            };
+            candidates.push((pit_entry, index));
         }
 
-        // 3. Partition deduplication: last writer wins
+        // 2. Partition deduplication: last writer wins
         let mut mapped_partition_ids = HashSet::new();
         let mut unique_candidates = Vec::new();
         for candidate in candidates.into_iter().rev() {
-            if mapped_partition_ids.insert(candidate.pit_entry.partition_id) {
+            if mapped_partition_ids.insert(candidate.0.partition_id) {
                 unique_candidates.push(candidate);
             }
         }
         unique_candidates.reverse();
 
-        // 4. Drop partitions excluded with skip targets
-        unique_candidates.retain(|candidate| {
-            if skipped_ids.contains(&candidate.pit_entry.partition_id) {
+        // 3. Drop partitions excluded with skip targets
+        unique_candidates.retain(|(pit_entry, _)| {
+            if skipped_ids.contains(&pit_entry.partition_id) {
                 if report {
                     progress::println(&format!(
                         "Skipping {} (excluded with --skip)",
-                        candidate.pit_entry.partition_name.to_string_lossy()
+                        pit_entry.partition_name.to_string_lossy()
                     ));
                 }
                 false
@@ -592,72 +623,46 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashCo
             }
         });
 
-        // 5. Inspect headers and validate sizes only for unique planned partitions
-        let mut planned_partitions = Vec::with_capacity(unique_candidates.len());
-        for candidate in unique_candidates {
-            let (source, is_lz4, display_name) = match candidate.source {
-                CandidateSource::Archive(entry) => (
-                    FirmwarePartitionSource::Package {
-                        index: entry.package_index,
-                        offset: entry.offset,
-                        size: entry.size,
-                    },
-                    entry.is_lz4,
-                    entry.original_name,
-                ),
-                CandidateSource::Standalone { index, is_lz4 } => {
-                    let (_, name, reader) = &mut self.partitions[index];
-                    let display_name = name.clone();
-                    let size = reader
-                        .seek(SeekFrom::End(0))
-                        .await
-                        .map_err(|e| FlashError::FileReadFailed(display_name.clone(), e))?;
-                    (
-                        FirmwarePartitionSource::Image { index, size },
-                        is_lz4,
-                        display_name,
-                    )
-                }
-            };
-
-            let image =
-                FirmwareImage::inspect(source, is_lz4, &mut self.packages, &mut self.partitions)
-                    .await
-                    .map_err(|e| FlashError::Lz4Header(display_name, e))?;
-
-            let planned = FirmwarePartitionPayload {
-                pit_entry: candidate.pit_entry,
-                image,
-            };
-
-            if !self.skip_size_check {
-                let partition_size = planned.pit_entry.partition_size();
-                if partition_size > 0 && planned.image.uncompressed_size() > partition_size {
+        // 4. Validate sizes
+        let mut resolved = Resolved {
+            super_skipped: pit_data
+                .entries
+                .iter()
+                .any(|e| skipped_ids.contains(&e.partition_id) && is_super_entry(e)),
+            ..Default::default()
+        };
+        for (pit_entry, index) in unique_candidates {
+            let image = self.images[index].image.clone();
+            if !self.options.skip_size_check {
+                let partition_size = pit_entry.partition_size();
+                if partition_size > 0 && image.uncompressed_size() > partition_size {
                     return Err(FlashError::PartitionTooSmall(
-                        planned
-                            .pit_entry
-                            .partition_name
-                            .to_string_lossy()
-                            .into_owned(),
+                        pit_entry.partition_name.to_string_lossy().into_owned(),
                     ));
                 }
             }
-
-            planned_partitions.push(planned);
+            resolved
+                .payloads
+                .push(FirmwarePartitionPayload { pit_entry, image });
+            resolved.image_indices.push(index);
         }
 
-        Ok(planned_partitions)
+        self.rewrite_vbmeta_payloads(pit_data, &mut resolved.payloads, report)
+            .await?;
+
+        Ok(resolved)
     }
 
-    // Helper 8: Set the requested AVB flags in vbmeta payloads. Like fastboot, the
-    // top-level vbmeta is looked up in boot on devices without a vbmeta partition.
+    // Set the requested AVB flags in vbmeta payloads. Like fastboot, the top-level
+    // vbmeta is looked up in boot on devices without a vbmeta partition.
     async fn rewrite_vbmeta_payloads(
         &mut self,
         pit_data: &PitData,
         planned_partitions: &mut [FirmwarePartitionPayload<'_>],
         report: bool,
     ) -> Result<(), FlashError> {
-        if self.vbmeta_flags == 0 {
+        let vbmeta_flags = self.options.vbmeta_flags;
+        if vbmeta_flags == 0 {
             return Ok(());
         }
 
@@ -691,8 +696,8 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashCo
                     .map_err(rewrite_err)?
             };
 
-            let Some(offset) = avb::rewrite_vbmeta(&mut data, self.vbmeta_flags, in_footer)
-                .map_err(rewrite_err)?
+            let Some(offset) =
+                avb::rewrite_vbmeta(&mut data, vbmeta_flags, in_footer).map_err(rewrite_err)?
             else {
                 if report {
                     progress::println(&format!(
@@ -726,21 +731,46 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashCo
         Ok(())
     }
 
-    // Helper 9: Flash deduplicated partition payloads to the device
-    async fn flash_partitions(
+    /// Determines the super partition size to check against the device. The value
+    /// from `super_used_size.txt` takes precedence over inspecting the super image.
+    async fn super_used_size(&mut self, resolved: &Resolved<'_>) -> Option<u32> {
+        if resolved.super_skipped {
+            return None;
+        }
+        if self.super_used_size.is_some() {
+            return self.super_used_size;
+        }
+
+        let (payload, &index) = resolved
+            .payloads
+            .iter()
+            .zip(&resolved.image_indices)
+            .find(|(payload, _)| is_super_entry(payload.pit_entry))?;
+        let planned = &self.images[index];
+        if planned.target.is_super() {
+            // Already inspected while pre-planning
+            return planned.super_used_size;
+        }
+        inspect_super_image(&payload.image, &mut self.packages, &mut self.partitions).await
+    }
+
+    /// Flashes resolved payloads to the device, then ends the session and reboots
+    /// as configured.
+    async fn flash(
         &mut self,
         session: &mut OdinSession,
-        planned_partitions: Vec<FirmwarePartitionPayload<'_>>,
-        reboot_mode: RebootMode,
+        resolved: Resolved<'_>,
+        super_used_size: Option<u32>,
     ) -> Result<(), FlashError> {
-        let total_bytes: u64 = planned_partitions
+        let total_bytes: u64 = resolved
+            .payloads
             .iter()
             .map(|p| p.image.uncompressed_size())
             .sum();
 
         session.set_total_bytes(total_bytes).await?;
 
-        if let Some(super_used_size) = self.super_used_size
+        if let Some(super_used_size) = super_used_size
             && super_used_size > 0
             && session.bootloader_protocol_version() >= 3
         {
@@ -756,7 +786,7 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashCo
                 .map_err(FlashError::SuperSizeCheckFailed)?;
         }
 
-        for planned in planned_partitions {
+        for planned in resolved.payloads {
             let name = planned.pit_entry.partition_name.to_string_lossy();
             let partition_size = planned.image.uncompressed_size();
 
@@ -785,7 +815,7 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashCo
 
         session.end_session().await?;
 
-        match reboot_mode {
+        match self.options.reboot_mode {
             RebootMode::Normal => {
                 session.reboot_device().await?;
             }
@@ -799,13 +829,63 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashCo
     }
 }
 
+/// Inspects the LP metadata of a super image, returning `None` if it cannot be read.
+async fn inspect_super_image<P, I>(
+    image: &FirmwareImage,
+    packages: &mut [(String, P)],
+    partitions: &mut [(Option<String>, String, I)],
+) -> Option<u32>
+where
+    P: AsyncRead + AsyncSeek + Unpin,
+    I: AsyncRead + AsyncSeek + Unpin,
+{
+    let mut reader = image.source.open_reader(packages, partitions).await.ok()?;
+    inspect_super_partition(image, &mut reader).await
+}
+
+/// Resolves skip targets into the IDs of the PIT entries they match.
+fn resolve_skipped_partitions(
+    skip: &[String],
+    pit_data: &PitData,
+) -> Result<HashSet<u32>, FlashError> {
+    let mut skipped_ids = HashSet::new();
+    for target in skip {
+        let mut matched = false;
+        for entry in &pit_data.entries {
+            if is_skip_target(entry, target) {
+                skipped_ids.insert(entry.partition_id);
+                matched = true;
+            }
+        }
+        if !matched {
+            return Err(FlashError::SkipTargetNotFound(target.clone()));
+        }
+    }
+    Ok(skipped_ids)
+}
+
+/// Downloads and parses the PIT from the device.
+async fn download_pit(session: &mut OdinSession) -> Result<PitData, FlashError> {
+    progress::println("Downloading device's PIT file");
+    let pit_buffer = session.receive_pit_info().await?;
+    PitData::new(&pit_buffer).map_err(FlashError::PitUnpackFailed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::OdinError;
     use crate::firmware::Lz4FrameHeader;
     use crate::firmware::tests::build_tar;
     use crate::odin::OdinConnection;
     use crate::usb::{MockBackend, MockEvent};
+
+    impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashConfig<P, I> {
+        /// Pre-plans and executes the flash.
+        async fn run(self, session: &mut OdinSession) -> Result<(), FlashError> {
+            self.preplan().await?.execute(session).await
+        }
+    }
 
     #[test]
     fn test_flashes_userdata() {
@@ -838,13 +918,12 @@ mod tests {
             connection.init().await.unwrap();
             let mut session = connection.begin_session().await.unwrap();
 
-            let mut manager = FlashConfig::new();
-            manager.super_used_size = Some(27276104);
-            manager.has_download_list = true;
+            let mut blueprint = FlashConfig::new().preplan().await.unwrap();
+            blueprint.has_download_list = true;
 
             assert!(
-                manager
-                    .flash_partitions(&mut session, Vec::new(), RebootMode::None)
+                blueprint
+                    .flash(&mut session, Resolved::default(), Some(27276104))
                     .await
                     .is_ok()
             );
@@ -863,12 +942,11 @@ mod tests {
             connection.init().await.unwrap();
             let mut session = connection.begin_session().await.unwrap();
 
-            let mut manager = FlashConfig::new();
-            manager.super_used_size = Some(27276104);
-            manager.has_download_list = true;
+            let mut blueprint = FlashConfig::new().preplan().await.unwrap();
+            blueprint.has_download_list = true;
 
-            let res = manager
-                .flash_partitions(&mut session, Vec::new(), RebootMode::None)
+            let res = blueprint
+                .flash(&mut session, Resolved::default(), Some(27276104))
                 .await;
             assert!(matches!(res, Err(FlashError::SuperSizeCheckFailed(_))));
         });
@@ -887,13 +965,12 @@ mod tests {
             connection.init().await.unwrap();
             let mut session = connection.begin_session().await.unwrap();
 
-            let mut manager = FlashConfig::new();
-            manager.super_used_size = Some(27276104);
-            manager.has_download_list = true;
+            let mut blueprint = FlashConfig::new().preplan().await.unwrap();
+            blueprint.has_download_list = true;
 
             assert!(
-                manager
-                    .flash_partitions(&mut session, Vec::new(), RebootMode::None)
+                blueprint
+                    .flash(&mut session, Resolved::default(), Some(27276104))
                     .await
                     .is_ok()
             );
@@ -912,15 +989,11 @@ mod tests {
                 env!("CARGO_MANIFEST_DIR"),
                 "/test-data/M3_EUR_OPEN_4G.pit"
             ));
-            let config = FlashConfig::new().pit(&pit_bytes[..]);
-
-            let local_pit = config.parse_local_pit().unwrap();
+            let local_pit = PitData::new(pit_bytes).unwrap();
             assert_eq!(local_pit.cpu_bl_id.to_string_lossy(), "Mx-MDM");
 
             session.send_pit_info(pit_bytes).await.unwrap();
-            let pit_data = FlashConfig::<Cursor<&[u8]>>::download_pit(&mut session)
-                .await
-                .unwrap();
+            let pit_data = download_pit(&mut session).await.unwrap();
             // M3_EUR_OPEN_4G.pit has Mx-MDM, verifying PIT was sent and updated device state
             assert_eq!(pit_data.cpu_bl_id.to_string_lossy(), "Mx-MDM");
         });
@@ -935,19 +1008,17 @@ mod tests {
     }
 
     fn skipped_names(targets: &[&str]) -> Result<Vec<String>, FlashError> {
-        futures::executor::block_on(async {
-            let pit_data = ab_pit_data();
-            let manager = FlashConfig::new().skip(targets);
-            let skipped_ids = manager.resolve_skipped_partitions(&pit_data)?;
-            let mut names: Vec<String> = pit_data
-                .entries
-                .iter()
-                .filter(|e| skipped_ids.contains(&e.partition_id))
-                .map(|e| e.partition_name.to_string_lossy().into_owned())
-                .collect();
-            names.sort();
-            Ok(names)
-        })
+        let pit_data = ab_pit_data();
+        let config = FlashConfig::new().skip(targets);
+        let skipped_ids = resolve_skipped_partitions(&config.options.skip, &pit_data)?;
+        let mut names: Vec<String> = pit_data
+            .entries
+            .iter()
+            .filter(|e| skipped_ids.contains(&e.partition_id))
+            .map(|e| e.partition_name.to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        Ok(names)
     }
 
     #[test]
@@ -983,7 +1054,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_partition_infos_drops_skipped_partitions() {
+    fn test_resolve_drops_skipped_partitions() {
         let partitions = vec![
             (None, "boot.img", Cursor::new(&b"DUMMY IMAGE DATA"[..])),
             (None, "vbmeta.img", Cursor::new(&b"DUMMY IMAGE DATA"[..])),
@@ -997,16 +1068,16 @@ mod tests {
 
         futures::executor::block_on(async {
             let pit_data = ab_pit_data();
-            let mut manager = FlashConfig::new()
+            let mut blueprint = FlashConfig::new()
                 .partitions(partitions)
-                .skip(&["boot.img", "VBMETA"]);
-            let skipped_ids = manager.resolve_skipped_partitions(&pit_data).unwrap();
-            let infos = manager
-                .build_partition_infos(&pit_data, &[], &skipped_ids, true)
+                .skip(&["boot.img", "VBMETA"])
+                .preplan()
                 .await
                 .unwrap();
+            let resolved = blueprint.resolve(&pit_data, true).await.unwrap();
 
-            let names: Vec<String> = infos
+            let names: Vec<String> = resolved
+                .payloads
                 .iter()
                 .map(|p| p.pit_entry.partition_name.to_string_lossy().into_owned())
                 .collect();
@@ -1036,7 +1107,7 @@ mod tests {
                 FlashConfig::new()
                     .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
                     .skip(skip)
-                    .execute(&mut session)
+                    .run(&mut session)
                     .await
             })
         };
@@ -1074,10 +1145,14 @@ mod tests {
         verification: bool,
     ) -> Result<(), FlashError> {
         futures::executor::block_on(async {
-            FlashConfig::new()
+            let mut blueprint = FlashConfig::new()
                 .partitions(partitions.into_iter().map(|r| (None, "part", r)))
                 .disable_verity(verity)
                 .disable_verification(verification)
+                .preplan()
+                .await
+                .unwrap();
+            blueprint
                 .rewrite_vbmeta_payloads(pit_data, planned, true)
                 .await
         })
@@ -1307,7 +1382,7 @@ mod tests {
                 FlashConfig::new()
                     .packages([(name, Cursor::new(tar_bytes))])
                     .disable_verity(verity)
-                    .execute(&mut session)
+                    .run(&mut session)
                     .await
             })
         };
@@ -1337,7 +1412,7 @@ mod tests {
             let res = FlashConfig::new()
                 .erase(true)
                 .packages([("AP.tar", Cursor::new(truncated))])
-                .execute(&mut session)
+                .run(&mut session)
                 .await;
 
             assert!(matches!(res, Err(FlashError::ArchiveCorrupted(pkg, _)) if pkg == "AP.tar"));
@@ -1367,7 +1442,7 @@ mod tests {
                 .erase(true)
                 .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
                 .skip(&["nonexistent_partition"])
-                .execute(&mut session)
+                .run(&mut session)
                 .await;
 
             assert!(
@@ -1402,7 +1477,7 @@ mod tests {
                 .erase(true)
                 .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
                 .disable_verity(true)
-                .execute(&mut session)
+                .run(&mut session)
                 .await;
 
             assert!(
@@ -1436,7 +1511,7 @@ mod tests {
                 .pit(&pit_bytes[..])
                 .erase(true)
                 .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
-                .execute(&mut session)
+                .run(&mut session)
                 .await
                 .unwrap();
 
@@ -1463,7 +1538,7 @@ mod tests {
             FlashConfig::new()
                 .erase(true)
                 .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
-                .execute(&mut session)
+                .run(&mut session)
                 .await
                 .unwrap();
 
@@ -1490,7 +1565,7 @@ mod tests {
                 .pit(b"invalid_pit_bytes")
                 .erase(true)
                 .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
-                .execute(&mut session)
+                .run(&mut session)
                 .await;
 
             assert!(matches!(res, Err(FlashError::PitUnpackFailed(_))));
@@ -1532,7 +1607,7 @@ mod tests {
                 .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
                 .disable_verity(true)
                 .disable_verification(true)
-                .execute(&mut session)
+                .run(&mut session)
                 .await
                 .unwrap();
 
@@ -1563,7 +1638,7 @@ mod tests {
 
             FlashConfig::new()
                 .packages([("AP.tar", Cursor::new(raw_tar.as_slice()))])
-                .execute(&mut session)
+                .run(&mut session)
                 .await
                 .unwrap();
 
@@ -1590,7 +1665,7 @@ mod tests {
 
             FlashConfig::new()
                 .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
-                .execute(&mut session)
+                .run(&mut session)
                 .await
                 .unwrap();
 
@@ -1676,7 +1751,7 @@ mod tests {
                 .pit(&pit_bytes[..])
                 .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
                 .skip(&["DTBO"])
-                .execute(&mut session)
+                .run(&mut session)
                 .await
         });
         crate::progress::clear_progress();
@@ -1688,5 +1763,311 @@ mod tests {
             .filter(|m| m.as_str() == "Skipping DTBO_A (excluded with --skip)")
             .count();
         assert_eq!(count, 1, "messages: {:?}", *messages);
+    }
+
+    /// Summarizes the images of a blueprint for comparisons.
+    fn image_summary<P, I>(
+        blueprint: &FlashBlueprint<P, I>,
+    ) -> Vec<(String, u64, Option<u64>, Option<u32>)> {
+        blueprint
+            .images
+            .iter()
+            .map(|planned| {
+                (
+                    format!("{:?}", planned.target),
+                    planned.image.size(),
+                    planned.image.lz4_header.as_ref().map(|h| h.content_size),
+                    planned.super_used_size,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_preplan_is_deterministic_without_device() {
+        let (vendor_lz4, _) = lz4_compress(&[0xAB; 4096]);
+        let tar_bytes = build_tar(&[("boot.img", b"BOOT"), ("vendor.img.lz4", &vendor_lz4)]);
+
+        let preplan = || {
+            futures::executor::block_on(
+                FlashConfig::new()
+                    .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
+                    .partitions([
+                        (Some("12".to_string()), "a.img", Cursor::new(&b"A"[..])),
+                        (Some("BOOT".to_string()), "b.img", Cursor::new(&b"BB"[..])),
+                    ])
+                    // Skip targets are only resolved against a PIT during execution
+                    .skip(&["nonexistent"])
+                    .preplan(),
+            )
+            .unwrap()
+        };
+
+        let summary = image_summary(&preplan());
+        assert_eq!(summary, image_summary(&preplan()));
+        assert_eq!(
+            summary,
+            [
+                ("File(\"boot.img\")".to_string(), 4, None, None),
+                (
+                    "File(\"vendor.img\")".to_string(),
+                    vendor_lz4.len() as u64,
+                    Some(4096),
+                    None
+                ),
+                ("PartitionId(12)".to_string(), 1, None, None),
+                ("Partition(\"BOOT\")".to_string(), 2, None, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_preplan_rejects_corrupt_lz4_regardless_of_skip() {
+        let tar_bytes = build_tar(&[("boot.img.lz4", &[0xFF; 64]), ("orphan.img.lz4", b"")]);
+        let skips: [&[&str]; 3] = [&[], &["boot.img", "orphan.img"], &["BOOT"]];
+        for skip in skips {
+            let res = futures::executor::block_on(
+                FlashConfig::new()
+                    .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
+                    .skip(skip)
+                    .preplan(),
+            );
+            assert!(matches!(res, Err(FlashError::Lz4Header(name, _)) if name == "boot.img.lz4"));
+        }
+
+        // A corrupt image is rejected even if it would be overridden by a later one
+        let res = futures::executor::block_on(
+            FlashConfig::new()
+                .partitions([
+                    (None, "boot.img.lz4", Cursor::new(&[0xFFu8; 64][..])),
+                    (
+                        Some("BOOT".to_string()),
+                        "boot.img",
+                        Cursor::new(&b"BOOT"[..]),
+                    ),
+                ])
+                .preplan(),
+        );
+        assert!(matches!(res, Err(FlashError::Lz4Header(name, _)) if name == "boot.img.lz4"));
+    }
+
+    #[test]
+    fn test_preplan_rejects_invalid_inputs() {
+        let tar_bytes = build_tar(&[("boot.img", b"BOOT")]);
+        let preplan = |config: FlashConfig<Cursor<&[u8]>>| {
+            futures::executor::block_on(config.preplan()).map(|_| ())
+        };
+
+        let res = preplan(FlashConfig::new().sales_code(Some("TOOLONG")));
+        assert!(
+            matches!(res, Err(FlashError::Odin(OdinError::InvalidSalesCode(code))) if code == "TOOLONG")
+        );
+
+        let res = preplan(
+            FlashConfig::new()
+                .pit(&b"invalid"[..])
+                .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))]),
+        );
+        assert!(matches!(res, Err(FlashError::PitUnpackFailed(_))));
+
+        let pit_tar = build_tar(&[("boot.img", b"BOOT"), ("device.pit", b"invalid")]);
+        let res =
+            preplan(FlashConfig::new().packages([("CSC.tar", Cursor::new(pit_tar.as_slice()))]));
+        assert!(matches!(res, Err(FlashError::PitUnpackFailed(_))));
+
+        let _guard = crate::progress::TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut md5_tar = tar_bytes.clone();
+        md5_tar.extend_from_slice(b"0123456789abcdef0123456789abcdef  AP.tar\n");
+        let res =
+            preplan(FlashConfig::new().packages([("AP.tar.md5", Cursor::new(md5_tar.as_slice()))]));
+        assert!(
+            matches!(res, Err(FlashError::Md5VerificationFailed(name, _)) if name == "AP.tar.md5")
+        );
+    }
+
+    #[test]
+    fn test_preplan_inspects_super_images() {
+        let super_img = crate::lp::tests::build_test_raw_image(&[(2048, 0, 4096)]);
+        let expected = crate::lp::inspect_super_bytes(&super_img);
+        assert!(expected.is_some());
+
+        let tar_bytes = build_tar(&[("super.img", &super_img)]);
+        let blueprint = futures::executor::block_on(
+            FlashConfig::new()
+                .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
+                .partitions([
+                    (
+                        Some("SUPER".to_string()),
+                        "a.img",
+                        Cursor::new(&super_img[..]),
+                    ),
+                    (Some("7".to_string()), "b.img", Cursor::new(&super_img[..])),
+                ])
+                .preplan(),
+        )
+        .unwrap();
+        let sizes: Vec<_> = blueprint.images.iter().map(|i| i.super_used_size).collect();
+        // Partition IDs cannot be identified as super without a PIT
+        assert_eq!(sizes, [expected, expected, None]);
+
+        // super_used_size.txt takes precedence over inspecting images
+        let tar_bytes = build_tar(&[
+            ("meta-data/super_used_size.txt", b"123\n"),
+            ("super.img", &super_img),
+        ]);
+        let blueprint = futures::executor::block_on(
+            FlashConfig::new()
+                .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
+                .preplan(),
+        )
+        .unwrap();
+        assert_eq!(blueprint.super_used_size, Some(123));
+        assert_eq!(blueprint.images[0].super_used_size, None);
+    }
+
+    #[test]
+    fn test_super_used_size_inspects_partition_id_targets() {
+        let super_img = crate::lp::tests::build_test_raw_image(&[(2048, 0, 4096)]);
+        let pit_data = ab_pit_data();
+        let super_id = find_entry(&pit_data, "SUPER").partition_id;
+
+        futures::executor::block_on(async {
+            let mut blueprint = FlashConfig::new()
+                .partitions([(
+                    Some(super_id.to_string()),
+                    "super.img",
+                    Cursor::new(&super_img[..]),
+                )])
+                .preplan()
+                .await
+                .unwrap();
+            assert_eq!(blueprint.images[0].super_used_size, None);
+
+            let resolved = blueprint.resolve(&pit_data, true).await.unwrap();
+            assert_eq!(
+                blueprint.super_used_size(&resolved).await,
+                crate::lp::inspect_super_bytes(&super_img)
+            );
+        });
+    }
+
+    #[test]
+    fn test_blueprint_flashes_userdata() {
+        let tar_bytes = build_tar(&[("boot.img", b"BOOT"), ("AP/userdata.img", b"DATA")]);
+        let listed_tar = build_tar(&[
+            ("meta-data/download-list.txt", b"boot.img\n"),
+            ("boot.img", b"BOOT"),
+            ("userdata.img", b"DATA"),
+        ]);
+        let boot_tar = build_tar(&[("boot.img", b"BOOT")]);
+
+        type Partitions<'a> = Vec<(Option<String>, &'a str, Cursor<&'a [u8]>)>;
+        let flashes_userdata = |tar: &[u8], partitions: Partitions, skip: &[&str]| {
+            futures::executor::block_on(
+                FlashConfig::new()
+                    .packages([("AP.tar", Cursor::new(tar))])
+                    .partitions(partitions)
+                    .skip(skip)
+                    .preplan(),
+            )
+            .unwrap()
+            .flashes_userdata()
+        };
+        let data = || Cursor::new(&b"DATA"[..]);
+
+        assert!(flashes_userdata(&tar_bytes, vec![], &[]));
+        assert!(!flashes_userdata(&tar_bytes, vec![], &["userdata"]));
+        assert!(!flashes_userdata(&tar_bytes, vec![], &[" USERDATA "]));
+        assert!(!flashes_userdata(
+            &tar_bytes,
+            vec![],
+            &["out/userdata.img.lz4"]
+        ));
+        assert!(flashes_userdata(&tar_bytes, vec![], &["boot"]));
+        assert!(!flashes_userdata(&listed_tar, vec![], &[]));
+        assert!(!flashes_userdata(&boot_tar, vec![], &[]));
+        assert!(flashes_userdata(
+            &boot_tar,
+            vec![(None, "userdata.img", data())],
+            &[]
+        ));
+        assert!(flashes_userdata(
+            &boot_tar,
+            vec![(Some("USERDATA".to_string()), "data.img", data())],
+            &[]
+        ));
+        // Partition IDs cannot be resolved without a PIT
+        assert!(!flashes_userdata(
+            &boot_tar,
+            vec![(Some("42".to_string()), "userdata.img", data())],
+            &[]
+        ));
+    }
+
+    #[test]
+    fn test_resolve_last_writer_wins() {
+        let bl_tar = build_tar(&[("boot.img", b"FIRST")]);
+        let ap_tar = build_tar(&[("boot.img", b"SECOND")]);
+        let pit_data = ab_pit_data();
+        let boot_name = find_pit_entry_by_filename(&pit_data, "boot.img")
+            .unwrap()
+            .partition_name
+            .to_string_lossy()
+            .into_owned();
+
+        futures::executor::block_on(async {
+            let packages = || {
+                [
+                    ("BL.tar", Cursor::new(bl_tar.as_slice())),
+                    ("AP.tar", Cursor::new(ap_tar.as_slice())),
+                ]
+            };
+
+            let mut blueprint = FlashConfig::new()
+                .packages(packages())
+                .preplan()
+                .await
+                .unwrap();
+            let resolved = blueprint.resolve(&pit_data, true).await.unwrap();
+            assert_eq!(resolved.payloads.len(), 1);
+            assert!(matches!(
+                resolved.payloads[0].image.source,
+                FirmwarePartitionSource::Package { index: 1, .. }
+            ));
+
+            // Explicit partitions come after packages, so they win
+            let mut blueprint = FlashConfig::new()
+                .packages(packages())
+                .partitions([(
+                    Some(boot_name.clone()),
+                    "my_boot.img",
+                    Cursor::new(&b"MINE"[..]),
+                )])
+                .preplan()
+                .await
+                .unwrap();
+            let resolved = blueprint.resolve(&pit_data, true).await.unwrap();
+            assert_eq!(resolved.payloads.len(), 1);
+            assert!(matches!(
+                resolved.payloads[0].image.source,
+                FirmwarePartitionSource::Image { index: 0, .. }
+            ));
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_phase_futures_are_send() {
+        fn assert_send<T: Send>(_: &T) {}
+
+        let preplan = FlashConfig::new()
+            .packages([("AP.tar", Cursor::new(&b""[..]))])
+            .preplan();
+        assert_send(&preplan);
+        let _ = |blueprint: FlashBlueprint, session: &mut OdinSession| {
+            assert_send(&blueprint.execute(session));
+        };
     }
 }

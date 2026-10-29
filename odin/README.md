@@ -45,6 +45,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+### Flashing Firmware
+
+Flashing happens in three phases: configuring a `FlashConfig` performs no I/O, `preplan` reads and validates the inputs without a device, and `execute` flashes the device.
+
+```rust,no_run
+use samloader_odin::{
+    FlashConfig, OdinConnection, UsbBackendOption, create_backend,
+    futures::{executor::block_on, io::AllowStdIo},
+};
+use std::fs::File;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    block_on(async {
+        // 1. Configure the flash
+        let ap = AllowStdIo::new(File::open("AP.tar.md5")?);
+        let config = FlashConfig::new().packages([("AP.tar.md5", ap)]);
+
+        // 2. Verify and index the inputs before connecting to a device
+        let blueprint = config.preplan().await?;
+        if blueprint.flashes_userdata() {
+            println!("This will wipe the device's data.");
+        }
+
+        // 3. Connect to the device and flash
+        let usb = create_backend(UsbBackendOption::Nusb, true).await?;
+        let mut connection = OdinConnection::new(usb);
+        connection.init().await?;
+        let mut session = connection.begin_session().await?;
+        blueprint.execute(&mut session).await?;
+
+        Ok(())
+    })
+}
+```
+
 ## WebAssembly
 
 The `nusb` backend supports `wasm32-unknown-unknown` in browsers with [WebUSB](https://wicg.github.io/webusb/) support (Chromium-based browsers). The `rusb` and `serialport` backends are not available on WebAssembly.

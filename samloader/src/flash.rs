@@ -312,7 +312,7 @@ fn flash(args: FlashArgs) -> Result<(), Box<dyn Error>> {
             config = config.pit(buffer);
         }
 
-        config.execute(&mut session).await?;
+        config.preplan().await?.execute(&mut session).await?;
         Ok(())
     })
 }

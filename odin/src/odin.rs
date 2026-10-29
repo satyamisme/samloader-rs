@@ -477,11 +477,7 @@ impl OdinSession {
 
     /// Sets the device CSC / Sales Code in bootloader parameter storage (Opcode 0x64, Subcmd 9).
     pub async fn set_sales_code(&mut self, sales_code: &str) -> Result<(), OdinError> {
-        let bytes = sales_code.as_bytes();
-        if bytes.len() != 3 || !bytes.iter().all(|b| b.is_ascii_alphanumeric()) {
-            return Err(OdinError::InvalidSalesCode(sales_code.to_string()));
-        }
-        let code = [bytes[0], bytes[1], bytes[2]];
+        let code = parse_sales_code(sales_code)?;
         let cmd = Command::session_sales_code(code);
         let value = self.request_and_response(&cmd, 3000).await?;
         if value != 0 {
@@ -689,6 +685,14 @@ impl OdinSession {
         }
 
         Ok(())
+    }
+}
+
+/// Validates a CSC / sales code, which must be 3 alphanumeric ASCII characters.
+pub(crate) fn parse_sales_code(sales_code: &str) -> Result<[u8; 3], OdinError> {
+    match *sales_code.as_bytes() {
+        [a, b, c] if [a, b, c].iter().all(u8::is_ascii_alphanumeric) => Ok([a, b, c]),
+        _ => Err(OdinError::InvalidSalesCode(sales_code.to_string())),
     }
 }
 
