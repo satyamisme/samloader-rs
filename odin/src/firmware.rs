@@ -12,16 +12,200 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::progress::FlashEvent;
+use crate::FlashError;
+use crate::progress::{self, FlashEvent};
+use crate::tar::TarArchive;
 use fast_md5::Md5;
 use futures::StreamExt;
 use futures::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, Cursor};
 use futures::stream::{self, Stream};
 use samloader_pit::PitEntry;
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::io::{self, SeekFrom};
+use std::path::Path;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+
+/// A file inside a TAR package.
+#[derive(Clone, Debug)]
+pub(crate) struct PackageEntry {
+    /// Path of the file inside the archive.
+    pub(crate) original_name: String,
+    /// File name with any directory and `.lz4` suffix stripped.
+    pub(crate) normalized_name: String,
+    /// Index of the containing package.
+    pub(crate) package_index: usize,
+    /// Byte offset of the file's data within the package.
+    pub(crate) offset: u64,
+    /// Size of the file's data in bytes.
+    pub(crate) size: u64,
+    /// Whether the file name has a `.lz4` suffix.
+    pub(crate) is_lz4: bool,
+}
+
+/// The flashable contents of a set of TAR packages, honoring `download-list.txt`.
+pub(crate) struct PackageIndex {
+    /// Files to consider for flashing, in package order. Metadata and PIT files
+    /// are excluded.
+    pub(crate) entries: Vec<PackageEntry>,
+    /// Whether any package contained a `download-list.txt`.
+    pub(crate) has_download_list: bool,
+    /// Value of `super_used_size.txt`, if present.
+    pub(crate) super_used_size: Option<u32>,
+    /// The first PIT file found, if requested.
+    pub(crate) pit_bytes: Option<Vec<u8>>,
+}
+
+impl PackageIndex {
+    /// Indexes the files in `packages`. Readers are only accessed through
+    /// absolute seeks. If `want_pit` is set, the first PIT file found is read.
+    pub(crate) async fn scan<R: AsyncRead + AsyncSeek + Unpin>(
+        packages: &mut [(String, R)],
+        want_pit: bool,
+    ) -> Result<Self, FlashError> {
+        if packages.is_empty() {
+            return Ok(Self {
+                entries: Vec::new(),
+                has_download_list: false,
+                super_used_size: None,
+                pit_bytes: None,
+            });
+        }
+
+        let mut archives_download_lists: Vec<HashSet<String>> = Vec::new();
+        let mut all_packages_entries: Vec<Vec<PackageEntry>> = Vec::new();
+        let mut pit_from_tar: Option<Vec<u8>> = None;
+        let mut has_download_list = false;
+        let mut super_used_size = None;
+
+        for (package_index, (pkg_name, reader)) in packages.iter_mut().enumerate() {
+            let mut archive = TarArchive::new(&mut *reader);
+            let mut package_entries = Vec::new();
+
+            while let Some(mut entry) = archive
+                .next_entry()
+                .await
+                .map_err(|e| FlashError::ArchiveCorrupted(pkg_name.clone(), e))?
+            {
+                let entry_path = entry.path().to_string();
+                let offset = entry.raw_file_position();
+                let size = entry.size();
+
+                let (normalized_name, is_lz4) = normalize_basename(&entry_path);
+
+                if normalized_name == "download-list.txt" {
+                    let mut content = String::new();
+                    entry
+                        .read_to_string(&mut content)
+                        .await
+                        .map_err(|e| FlashError::ArchiveCorrupted(pkg_name.clone(), e))?;
+
+                    has_download_list = true;
+                    let download_list = content
+                        .lines()
+                        .filter_map(|s| {
+                            let s = s.trim();
+                            if s.is_empty() {
+                                None
+                            } else {
+                                Some(s.to_string())
+                            }
+                        })
+                        .collect();
+                    archives_download_lists.push(download_list);
+                } else if normalized_name == "super_used_size.txt" {
+                    let mut content = String::new();
+                    entry
+                        .read_to_string(&mut content)
+                        .await
+                        .map_err(|e| FlashError::ArchiveCorrupted(pkg_name.clone(), e))?;
+                    let val = content.trim().parse::<u32>().map_err(|e| {
+                        FlashError::ArchiveCorrupted(
+                            pkg_name.clone(),
+                            io::Error::new(io::ErrorKind::InvalidData, e),
+                        )
+                    })?;
+                    super_used_size = Some(val);
+                } else if normalized_name.ends_with(".pit") {
+                    if want_pit && pit_from_tar.is_none() {
+                        let mut bytes = Vec::new();
+                        entry
+                            .read_to_end(&mut bytes)
+                            .await
+                            .map_err(|e| FlashError::ArchiveCorrupted(pkg_name.clone(), e))?;
+                        pit_from_tar = Some(bytes);
+                    }
+                } else {
+                    package_entries.push(PackageEntry {
+                        original_name: entry_path,
+                        normalized_name,
+                        package_index,
+                        offset,
+                        size,
+                        is_lz4,
+                    });
+                }
+            }
+
+            all_packages_entries.push(package_entries);
+        }
+
+        // If any package contained a manifest, we use it as our global download allowlist
+        let download_allowlist = if let Some((first, rest)) = archives_download_lists.split_first()
+        {
+            if !rest.iter().all(|m| m == first) {
+                return Err(FlashError::CrossArchiveInconsistency);
+            }
+            Some(first)
+        } else {
+            None
+        };
+
+        let mut resolved_entries: Vec<PackageEntry> = Vec::new();
+
+        // Apply manifest filtering and positional precedence (last-writer-wins)
+        for package_entries in all_packages_entries {
+            for entry in package_entries {
+                if let Some(allowlist) = download_allowlist {
+                    if allowlist.contains(&entry.normalized_name) {
+                        resolved_entries.push(entry);
+                    } else {
+                        progress::println(&format!(
+                            "Skipping {} (not in download-list.txt)",
+                            entry.original_name
+                        ));
+                    }
+                } else {
+                    resolved_entries.push(entry);
+                }
+            }
+        }
+
+        Ok(Self {
+            entries: resolved_entries,
+            has_download_list,
+            super_used_size,
+            pit_bytes: pit_from_tar,
+        })
+    }
+}
+
+/// Strips the directory and `.lz4` suffix from a file name, also returning
+/// whether the suffix was present.
+pub(crate) fn normalize_basename(path_str: &str) -> (String, bool) {
+    let mut filename = Path::new(path_str)
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    if filename.to_lowercase().ends_with(".lz4") {
+        filename.truncate(filename.len() - 4);
+        (filename, true)
+    } else {
+        (filename, false)
+    }
+}
 
 // This is asserted by Lz4FrameHeader so the header size is always 15
 const LZ4_HEADER_SIZE: usize = 15;
@@ -607,7 +791,7 @@ impl<'r, R: AsyncRead + Unpin> Lz4DecompressedSliceIterator<'r, R> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::FlashProgress;
     use fast_md5::Md5;
@@ -817,6 +1001,56 @@ mod tests {
                 .collect()
                 .await;
             assert!(results.iter().any(|r| r.is_err()));
+        });
+    }
+
+    pub(crate) fn build_tar(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        for &(path, content) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, path, content).unwrap();
+        }
+        builder.finish().unwrap();
+        builder.into_inner().unwrap()
+    }
+
+    #[test]
+    fn test_package_index_metadata_and_manifest() {
+        let tar_bytes = build_tar(&[
+            ("meta-data/super_used_size.txt", b"27276104\n"),
+            ("meta-data/download-list.txt", b"boot.img\n"),
+            ("boot.img", b"DUMMY BOOT IMAGE DATA"),
+        ]);
+
+        futures::executor::block_on(async {
+            let mut packages = [(
+                "test_package.tar".to_string(),
+                Cursor::new(tar_bytes.as_slice()),
+            )];
+            let index = PackageIndex::scan(&mut packages, true).await.unwrap();
+
+            assert_eq!(index.super_used_size, Some(27276104));
+            assert!(index.has_download_list);
+            assert_eq!(index.entries.len(), 1);
+            assert_eq!(index.entries[0].normalized_name, "boot.img");
+        });
+    }
+
+    #[test]
+    fn test_package_index_corrupt_manifest_fails() {
+        let tar_bytes = build_tar(&[("meta-data/download-list.txt", &[0xFF, 0xFE, 0xFD])]);
+
+        futures::executor::block_on(async {
+            let mut packages = [(
+                "corrupt_manifest.tar".to_string(),
+                Cursor::new(tar_bytes.as_slice()),
+            )];
+            let result = PackageIndex::scan(&mut packages, true).await;
+
+            assert!(matches!(result, Err(FlashError::ArchiveCorrupted(_, _))));
         });
     }
 }

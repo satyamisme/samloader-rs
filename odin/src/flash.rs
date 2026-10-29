@@ -17,164 +17,16 @@
 use crate::FlashError;
 use crate::avb;
 use crate::firmware::{
-    FirmwarePartitionPayload, FirmwarePartitionSource, Lz4FrameHeader, verify_md5_footer,
+    FirmwarePartitionPayload, FirmwarePartitionSource, Lz4FrameHeader, PackageEntry, PackageIndex,
+    normalize_basename, verify_md5_footer,
 };
 use crate::lp::inspect_super_partition;
 use crate::odin::OdinSession;
 use crate::progress::{self, FlashEvent};
-use crate::tar::TarArchive;
-use futures::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, Cursor};
+use futures::io::{AsyncRead, AsyncSeek, AsyncSeekExt, Cursor};
 use samloader_pit::{PitData, PitEntry};
 use std::collections::HashSet;
-use std::io::{self, SeekFrom};
-use std::path::Path;
-
-#[derive(Clone, Debug)]
-struct IndexedEntry {
-    original_name: String,
-    normalized_name: String,
-    package_index: usize,
-    offset: u64,
-    size: u64,
-    is_lz4: bool,
-}
-
-/// Result of indexing TAR packages.
-struct PackageScan {
-    entries: Vec<IndexedEntry>,
-    has_download_list: bool,
-    super_used_size: Option<u32>,
-    pit_bytes: Option<Vec<u8>>,
-}
-
-async fn scan_packages<R: AsyncRead + AsyncSeek + Unpin>(
-    packages: &mut [(String, R)],
-    want_pit: bool,
-) -> Result<PackageScan, FlashError> {
-    if packages.is_empty() {
-        return Ok(PackageScan {
-            entries: Vec::new(),
-            has_download_list: false,
-            super_used_size: None,
-            pit_bytes: None,
-        });
-    }
-
-    let mut archives_download_lists: Vec<HashSet<String>> = Vec::new();
-    let mut all_packages_entries: Vec<Vec<IndexedEntry>> = Vec::new();
-    let mut pit_from_tar: Option<Vec<u8>> = None;
-    let mut has_download_list = false;
-    let mut super_used_size = None;
-
-    for (package_index, (pkg_name, reader)) in packages.iter_mut().enumerate() {
-        let mut archive = TarArchive::new(&mut *reader);
-        let mut package_entries = Vec::new();
-
-        while let Some(mut entry) = archive
-            .next_entry()
-            .await
-            .map_err(|e| FlashError::ArchiveCorrupted(pkg_name.clone(), e))?
-        {
-            let entry_path = entry.path().to_string();
-            let offset = entry.raw_file_position();
-            let size = entry.size();
-
-            let (normalized_name, is_lz4) = normalize_basename(&entry_path);
-
-            if normalized_name == "download-list.txt" {
-                let mut content = String::new();
-                entry
-                    .read_to_string(&mut content)
-                    .await
-                    .map_err(|e| FlashError::ArchiveCorrupted(pkg_name.clone(), e))?;
-
-                has_download_list = true;
-                let download_list = content
-                    .lines()
-                    .filter_map(|s| {
-                        let s = s.trim();
-                        if s.is_empty() {
-                            None
-                        } else {
-                            Some(s.to_string())
-                        }
-                    })
-                    .collect();
-                archives_download_lists.push(download_list);
-            } else if normalized_name == "super_used_size.txt" {
-                let mut content = String::new();
-                entry
-                    .read_to_string(&mut content)
-                    .await
-                    .map_err(|e| FlashError::ArchiveCorrupted(pkg_name.clone(), e))?;
-                let val = content.trim().parse::<u32>().map_err(|e| {
-                    FlashError::ArchiveCorrupted(
-                        pkg_name.clone(),
-                        io::Error::new(io::ErrorKind::InvalidData, e),
-                    )
-                })?;
-                super_used_size = Some(val);
-            } else if normalized_name.ends_with(".pit") {
-                if want_pit && pit_from_tar.is_none() {
-                    let mut bytes = Vec::new();
-                    entry
-                        .read_to_end(&mut bytes)
-                        .await
-                        .map_err(|e| FlashError::ArchiveCorrupted(pkg_name.clone(), e))?;
-                    pit_from_tar = Some(bytes);
-                }
-            } else {
-                package_entries.push(IndexedEntry {
-                    original_name: entry_path,
-                    normalized_name,
-                    package_index,
-                    offset,
-                    size,
-                    is_lz4,
-                });
-            }
-        }
-
-        all_packages_entries.push(package_entries);
-    }
-
-    // If any package contained a manifest, we use it as our global download allowlist
-    let download_allowlist = if let Some((first, rest)) = archives_download_lists.split_first() {
-        if !rest.iter().all(|m| m == first) {
-            return Err(FlashError::CrossArchiveInconsistency);
-        }
-        Some(first)
-    } else {
-        None
-    };
-
-    let mut resolved_entries: Vec<IndexedEntry> = Vec::new();
-
-    // Apply manifest filtering and positional precedence (last-writer-wins)
-    for package_entries in all_packages_entries {
-        for entry in package_entries {
-            if let Some(allowlist) = download_allowlist {
-                if allowlist.contains(&entry.normalized_name) {
-                    resolved_entries.push(entry);
-                } else {
-                    progress::println(&format!(
-                        "Skipping {} (not in download-list.txt)",
-                        entry.original_name
-                    ));
-                }
-            } else {
-                resolved_entries.push(entry);
-            }
-        }
-    }
-
-    Ok(PackageScan {
-        entries: resolved_entries,
-        has_download_list,
-        super_used_size,
-        pit_bytes: pit_from_tar,
-    })
-}
+use std::io::SeekFrom;
 
 /// Lists the file names (directory and `.lz4` suffix stripped) that would be
 /// considered for flashing from `packages`, honoring `download-list.txt`.
@@ -186,7 +38,7 @@ async fn scan_packages<R: AsyncRead + AsyncSeek + Unpin>(
 pub async fn package_flash_files<R: AsyncRead + AsyncSeek + Unpin>(
     packages: &mut [(String, R)],
 ) -> Result<Vec<String>, FlashError> {
-    let scan = scan_packages(packages, false).await?;
+    let scan = PackageIndex::scan(packages, false).await?;
     Ok(scan
         .entries
         .into_iter()
@@ -217,20 +69,6 @@ pub fn flashes_userdata(names: &[impl AsRef<str>], skip: &[impl AsRef<str>]) -> 
         let (name, _) = normalize_basename(name.as_ref());
         name.to_ascii_lowercase().starts_with("userdata") && !is_skipped(&name)
     })
-}
-
-fn normalize_basename(path_str: &str) -> (String, bool) {
-    let mut filename = Path::new(path_str)
-        .file_name()
-        .map(|f| f.to_string_lossy().to_string())
-        .unwrap_or_default();
-
-    if filename.to_lowercase().ends_with(".lz4") {
-        filename.truncate(filename.len() - 4);
-        (filename, true)
-    } else {
-        (filename, false)
-    }
 }
 
 fn find_pit_entry_by_filename<'a>(pit_data: &'a PitData, filename: &str) -> Option<&'a PitEntry> {
@@ -580,9 +418,9 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashCo
     }
 
     // Helper 2: Scan TAR packages to find resolved entries and pull package PIT if needed
-    async fn scan_tar_packages(&mut self) -> Result<Vec<IndexedEntry>, FlashError> {
+    async fn scan_tar_packages(&mut self) -> Result<Vec<PackageEntry>, FlashError> {
         let want_pit = self.pit_file_bytes.is_none();
-        let scan = scan_packages(&mut self.packages, want_pit).await?;
+        let scan = PackageIndex::scan(&mut self.packages, want_pit).await?;
         if scan.has_download_list {
             self.has_download_list = true;
         }
@@ -613,7 +451,7 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashCo
     async fn plan_partitions<'c>(
         &mut self,
         pit_data: &'c PitData,
-        entries: &[IndexedEntry],
+        entries: &[PackageEntry],
         report: bool,
     ) -> Result<Vec<FirmwarePartitionPayload<'c>>, FlashError> {
         let skipped_ids = self.resolve_skipped_partitions(pit_data)?;
@@ -659,12 +497,12 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashCo
     async fn build_partition_infos<'c>(
         &mut self,
         pit_data: &'c PitData,
-        resolved_entries: &[IndexedEntry],
+        resolved_entries: &[PackageEntry],
         skipped_ids: &HashSet<u32>,
         report: bool,
     ) -> Result<Vec<FirmwarePartitionPayload<'c>>, FlashError> {
         enum CandidateSource {
-            Archive(IndexedEntry),
+            Archive(PackageEntry),
             Standalone { index: usize, is_lz4: bool },
         }
 
@@ -964,6 +802,7 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashCo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::firmware::tests::build_tar;
     use crate::odin::OdinConnection;
     use crate::usb::{MockBackend, MockEvent};
 
@@ -988,39 +827,6 @@ mod tests {
 
         // Skipping other partitions does not exclude userdata
         assert!(flashes_userdata(&["userdata.img"], &["boot", "super.img"]));
-    }
-
-    fn build_tar(files: &[(&str, &[u8])]) -> Vec<u8> {
-        let mut builder = tar::Builder::new(Vec::new());
-        for &(path, content) in files {
-            let mut header = tar::Header::new_gnu();
-            header.set_size(content.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            builder.append_data(&mut header, path, content).unwrap();
-        }
-        builder.finish().unwrap();
-        builder.into_inner().unwrap()
-    }
-
-    #[test]
-    fn test_scan_tar_packages_metadata_and_manifest() {
-        let tar_bytes = build_tar(&[
-            ("meta-data/super_used_size.txt", b"27276104\n"),
-            ("meta-data/download-list.txt", b"boot.img\n"),
-            ("boot.img", b"DUMMY BOOT IMAGE DATA"),
-        ]);
-
-        futures::executor::block_on(async {
-            let mut manager = FlashConfig::new()
-                .packages([("test_package.tar", Cursor::new(tar_bytes.as_slice()))]);
-            let resolved = manager.scan_tar_packages().await.unwrap();
-
-            assert_eq!(manager.super_used_size, Some(27276104));
-            assert!(manager.has_download_list);
-            assert_eq!(resolved.len(), 1);
-            assert_eq!(resolved[0].normalized_name, "boot.img");
-        });
     }
 
     #[test]
@@ -1090,19 +896,6 @@ mod tests {
                     .await
                     .is_ok()
             );
-        });
-    }
-
-    #[test]
-    fn test_scan_tar_packages_corrupt_manifest_fails() {
-        let tar_bytes = build_tar(&[("meta-data/download-list.txt", &[0xFF, 0xFE, 0xFD])]);
-
-        futures::executor::block_on(async {
-            let mut manager = FlashConfig::new()
-                .packages([("corrupt_manifest.tar", Cursor::new(tar_bytes.as_slice()))]);
-            let result = manager.scan_tar_packages().await;
-
-            assert!(matches!(result, Err(FlashError::ArchiveCorrupted(_, _))));
         });
     }
 
