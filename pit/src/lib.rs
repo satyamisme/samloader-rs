@@ -162,6 +162,51 @@ impl PitEntry {
         };
         block_size * self.block_count as u64
     }
+
+    /// Returns whether this is the dynamic `SUPER` partition, identified by its
+    /// partition name or its `super.img` flash file name. Names are compared
+    /// ignoring case.
+    pub fn is_super(&self) -> bool {
+        self.partition_name
+            .to_string_lossy()
+            .eq_ignore_ascii_case("SUPER")
+            || self
+                .flash_filename
+                .to_string_lossy()
+                .eq_ignore_ascii_case("super.img")
+    }
+
+    /// Returns whether this is a boot partition: `BOOT`, or its A/B slots `BOOT_A`
+    /// and `BOOT_B`. Names are compared ignoring case.
+    pub fn is_boot(&self) -> bool {
+        self.has_slotted_name("BOOT")
+    }
+
+    /// Returns whether this is the top-level vbmeta partition: `VBMETA`, or its A/B
+    /// slots `VBMETA_A` and `VBMETA_B`. Names are compared ignoring case.
+    pub fn is_top_level_vbmeta(&self) -> bool {
+        self.has_slotted_name("VBMETA")
+    }
+
+    /// Returns whether the partition name ends with `VBMETA`, `VBMETA_A` or `VBMETA_B`,
+    /// ignoring case. This includes the top-level vbmeta partition and prefixed ones
+    /// like `GUEST_VBMETA_A`, but not partitions that only start with it, like
+    /// `VBMETA_SYSTEM`.
+    pub fn is_vbmeta(&self) -> bool {
+        let name = self.partition_name.to_string_lossy().to_ascii_uppercase();
+        ["VBMETA", "VBMETA_A", "VBMETA_B"]
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
+    }
+
+    /// Returns whether the partition name is `base`, or `base` with an `_A` or `_B`
+    /// slot suffix, ignoring case.
+    fn has_slotted_name(&self, base: &str) -> bool {
+        let name = self.partition_name.to_string_lossy();
+        ["", "_A", "_B"]
+            .iter()
+            .any(|slot| name.eq_ignore_ascii_case(&format!("{base}{slot}")))
+    }
 }
 
 /// Represents the parsed layout and headers of a Partition Information Table (PIT).
@@ -224,6 +269,15 @@ impl PitData {
     /// Finds a partition entry by its numeric partition identifier.
     pub fn find_entry_by_id(&self, id: u32) -> Option<&PitEntry> {
         self.entries.iter().find(|e| e.partition_id == id)
+    }
+
+    /// Finds a partition entry by the name of the file flashed to it, ignoring case.
+    pub fn find_entry_by_flash_filename(&self, filename: &str) -> Option<&PitEntry> {
+        self.entries.iter().find(|e| {
+            e.flash_filename
+                .to_string_lossy()
+                .eq_ignore_ascii_case(filename)
+        })
     }
 
     /// Packs and serializes the structured PIT representation back into standard binary bytes.
@@ -341,5 +395,82 @@ mod tests {
         // parsing and not serialized by PitData::pack(). We verify that the actual
         // PIT data itself matches the original file exactly byte-for-byte.
         assert_eq!(&repacked_bytes, &original_bytes[..expected_data_size]);
+    }
+
+    #[test]
+    fn test_find_entries() {
+        let pit_data = PitData::new(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test-data/Q7MQ_EUR_OPENX.pit"
+        )))
+        .unwrap();
+
+        let entry = pit_data.find_entry_by_flash_filename("SUPER.IMG").unwrap();
+        assert_eq!(entry.partition_name.to_string_lossy(), "SUPER");
+        assert_eq!(
+            pit_data.find_entry_by_name("SUPER").unwrap().partition_id,
+            entry.partition_id
+        );
+        assert_eq!(
+            pit_data
+                .find_entry_by_id(entry.partition_id)
+                .unwrap()
+                .partition_name
+                .to_string_lossy(),
+            "SUPER"
+        );
+        assert!(
+            pit_data
+                .find_entry_by_flash_filename("missing.img")
+                .is_none()
+        );
+    }
+
+    fn entry(partition_name: &str, flash_filename: &str) -> PitEntry {
+        fn fixed<const LEN: usize>(s: &str) -> FixedString<LEN> {
+            let mut data = [0u8; LEN];
+            data[..s.len()].copy_from_slice(s.as_bytes());
+            FixedString { data }
+        }
+        PitEntry {
+            binary_type: BinaryType::ApplicationProcessor,
+            device_type: DeviceType::UFS,
+            partition_id: 0,
+            attributes: Default::default(),
+            update_attributes: Default::default(),
+            start_block: 0,
+            block_count: 0,
+            file_offset: 0,
+            file_size: 0,
+            partition_name: fixed(partition_name),
+            flash_filename: fixed(flash_filename),
+            fota_filename: Default::default(),
+        }
+    }
+
+    #[test]
+    fn test_partition_roles() {
+        assert!(entry("SUPER", "super.img").is_super());
+        assert!(entry("super", "").is_super());
+        assert!(entry("DYNAMIC", "SUPER.IMG").is_super());
+        assert!(!entry("SYSTEM", "system.img").is_super());
+
+        for name in ["BOOT", "boot_a", "BOOT_B"] {
+            assert!(entry(name, "").is_boot(), "{name}");
+        }
+        for name in ["INIT_BOOT", "BOOT_C", "BOOTLOADER"] {
+            assert!(!entry(name, "").is_boot(), "{name}");
+        }
+
+        for name in ["VBMETA", "vbmeta_a", "VBMETA_B"] {
+            let entry = entry(name, "");
+            assert!(entry.is_top_level_vbmeta() && entry.is_vbmeta(), "{name}");
+        }
+        let guest = entry("GUEST_VBMETA_A", "");
+        assert!(guest.is_vbmeta() && !guest.is_top_level_vbmeta());
+        for name in ["VBMETA_SYSTEM", "VBMETA_SYSTEM_A"] {
+            let entry = entry(name, "");
+            assert!(!entry.is_vbmeta() && !entry.is_top_level_vbmeta(), "{name}");
+        }
     }
 }
