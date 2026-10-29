@@ -298,7 +298,7 @@ impl FlashArgs {
             .as_chunks::<2>()
             .0
             .iter()
-            .map(|[name, file]| (Some(name.to_uppercase()), file.as_str()));
+            .map(|[name, file]| (Some(name.clone()), file.as_str()));
         let matched = self.file.iter().map(|file| (None, file.as_str()));
         explicit.chain(matched)
     }

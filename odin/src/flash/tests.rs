@@ -17,7 +17,7 @@
 use super::*;
 use crate::OdinError;
 use crate::test_util::{
-    M3_PIT, Q7MQ_PIT, ab_pit_data, build_tar, find_entry, lz4_compress, mock_session,
+    A14M_PIT, M3_PIT, Q7MQ_PIT, ab_pit_data, build_tar, find_entry, lz4_compress, mock_session,
 };
 use crate::usb::{MockBackend, MockEvent};
 
@@ -586,6 +586,45 @@ fn test_execute_order_without_local_pit() {
         assert_eq!(logged[1], MockEvent::NandErase);
         assert!(matches!(logged[2], MockEvent::Slice { .. }));
     });
+}
+
+#[test]
+fn test_execute_matches_partition_names_ignoring_case() {
+    // The Galaxy A14 4G (MediaTek) uses lowercase partition names
+    let pit_data = PitData::new(A14M_PIT).unwrap();
+    let init_boot_id = find_entry(&pit_data, "init_boot").partition_id;
+
+    for name in ["init_boot", "INIT_BOOT"] {
+        futures::executor::block_on(async {
+            let backend = MockBackend::new();
+            let events = backend.event_log();
+            let mut session = mock_session(backend).await;
+
+            let image = b"INIT BOOT IMAGE DATA";
+            FlashRequest::new()
+                .pit(A14M_PIT)
+                .partitions([(
+                    Some(name.to_string()),
+                    "init_boot.img",
+                    Cursor::new(&image[..]),
+                )])
+                .run(&mut session)
+                .await
+                .unwrap();
+
+            let logged = events.lock().unwrap();
+            let flashed: Vec<_> = logged
+                .iter()
+                .filter_map(|e| match e {
+                    MockEvent::Slice {
+                        partition_id, data, ..
+                    } => Some((*partition_id, data.as_slice())),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(flashed, [(init_boot_id, &image[..])], "{name}");
+        });
+    }
 }
 
 #[test]

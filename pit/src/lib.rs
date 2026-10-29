@@ -261,9 +261,20 @@ impl PitData {
         Self::read(&mut cursor)
     }
 
-    /// Finds a partition entry by its string name.
+    /// Finds a partition entry by its name, ignoring case. Partition names are
+    /// uppercase on most devices but lowercase on others, such as MediaTek ones,
+    /// so an exact match is only preferred.
     pub fn find_entry_by_name(&self, name: &str) -> Option<&PitEntry> {
-        self.entries.iter().find(|e| e.partition_name == name)
+        self.entries
+            .iter()
+            .find(|e| e.partition_name == name)
+            .or_else(|| {
+                self.entries.iter().find(|e| {
+                    e.partition_name
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case(name)
+                })
+            })
     }
 
     /// Finds a partition entry by its numeric partition identifier.
@@ -424,6 +435,29 @@ mod tests {
                 .find_entry_by_flash_filename("missing.img")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn test_find_entry_by_name_ignores_case() {
+        // MediaTek devices like the Galaxy A14 4G use lowercase partition names
+        let pit_data = PitData::new(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test-data/A14M_MEA_OPEN.pit"
+        )))
+        .unwrap();
+        for name in ["init_boot", "INIT_BOOT", "Init_Boot"] {
+            let entry = pit_data.find_entry_by_name(name).unwrap();
+            assert_eq!(entry.partition_name.to_string_lossy(), "init_boot");
+        }
+        assert!(pit_data.find_entry_by_name("init_boo").is_none());
+
+        // An exact match wins over one that differs in case
+        let mut pit_data = pit_data;
+        pit_data.entries = vec![entry("boot", ""), entry("BOOT", "")];
+        pit_data.entries[1].partition_id = 1;
+        assert_eq!(pit_data.find_entry_by_name("BOOT").unwrap().partition_id, 1);
+        assert_eq!(pit_data.find_entry_by_name("boot").unwrap().partition_id, 0);
+        assert_eq!(pit_data.find_entry_by_name("Boot").unwrap().partition_id, 0);
     }
 
     fn entry(partition_name: &str, flash_filename: &str) -> PitEntry {

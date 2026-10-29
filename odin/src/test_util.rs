@@ -32,6 +32,12 @@ pub(crate) const M3_PIT: &[u8] = include_bytes!(concat!(
     "/test-data/M3_EUR_OPEN_4G.pit"
 ));
 
+/// PIT of a MediaTek device with lowercase partition names (SM-A145R).
+pub(crate) const A14M_PIT: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/test-data/A14M_MEA_OPEN.pit"
+));
+
 /// Parses [`Q7MQ_PIT`].
 pub(crate) fn ab_pit_data() -> PitData {
     PitData::new(Q7MQ_PIT).unwrap()
