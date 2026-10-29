@@ -13,10 +13,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::flash::CliProgress;
 use crate::print_error;
+use crate::progress::CliProgress;
+use crate::session::connect;
 use samloader_odin::{
-    OdinConnection, RebootMode, UsbBackendOption, create_backend, detect_device,
+    RebootMode, UsbBackendOption, detect_device,
     futures::{executor::block_on, io::AllowStdIo},
     query_device_info, set_progress, verify_md5_footer,
 };
@@ -81,21 +82,7 @@ pub(crate) fn action_dump_pit(
 
     block_on(async {
         // Download PIT file from device.
-        let usb = match create_backend(usb_backend, wait).await {
-            Ok(u) => u,
-            Err(e) => {
-                print_error!("{}", e);
-                return 1;
-            }
-        };
-        let mut connection = OdinConnection::new(usb);
-
-        if let Err(e) = connection.init().await {
-            print_error!("{}", e);
-            return 1;
-        }
-
-        let mut session = match connection.begin_session().await {
+        let mut session = match connect(usb_backend, wait).await {
             Ok(s) => s,
             Err(e) => {
                 print_error!("{}", e);
@@ -180,21 +167,7 @@ pub(crate) fn action_print_pit(
         set_progress(CliProgress::new(verbose));
 
         block_on(async {
-            let usb = match create_backend(usb_backend, wait).await {
-                Ok(u) => u,
-                Err(e) => {
-                    print_error!("{}", e);
-                    return 1;
-                }
-            };
-            let mut connection = OdinConnection::new(usb);
-
-            if let Err(e) = connection.init().await {
-                print_error!("{}", e);
-                return 1;
-            }
-
-            let mut session = match connection.begin_session().await {
+            let mut session = match connect(usb_backend, wait).await {
                 Ok(s) => s,
                 Err(e) => {
                     print_error!("{}", e);

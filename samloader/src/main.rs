@@ -20,6 +20,8 @@ compile_error!("At least one USB backend must be enabled!");
 mod actions;
 mod download;
 mod flash;
+mod progress;
+mod session;
 
 use clap::builder::PossibleValuesParser;
 use clap::{Arg, ArgAction, ArgMatches, Command};
