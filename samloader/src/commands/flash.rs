@@ -53,7 +53,8 @@ fn open(path: &str) -> Result<AllowStdIo<File>, String> {
         .map_err(|e| format!("Failed to open file \"{}\": {}", path, e))
 }
 
-pub(crate) fn action_flash(
+/// Flashes firmware packages and partition images to the connected device.
+pub(crate) fn run(
     args: FlashArgs,
     usb_backend: UsbBackendOption,
     verbose: bool,

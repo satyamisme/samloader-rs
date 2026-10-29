@@ -59,7 +59,8 @@ impl DownloadProgress for ProgressWrapper<'_> {
     }
 }
 
-pub(crate) fn action_download(args: DownloadArgs, verbose: bool) -> Result<(), Box<dyn Error>> {
+/// Downloads and decrypts a firmware from Samsung's update servers.
+pub(crate) fn run(args: DownloadArgs, verbose: bool) -> Result<(), Box<dyn Error>> {
     let mut client = FusClient::new().expect("Unable to establish FusClient");
 
     let version = match &args.version {
