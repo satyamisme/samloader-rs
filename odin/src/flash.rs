@@ -485,15 +485,11 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashBl
     /// behind `session`.
     ///
     /// With a local PIT, the blueprint is first resolved against it to catch
-    /// errors before the PIT is flashed. Nothing destructive happens before the
-    /// blueprint has been resolved.
+    /// errors before the PIT is flashed. Nothing is written to the device, not
+    /// even the CSC, before the blueprint has been resolved.
     pub async fn execute(mut self, session: &mut OdinSession) -> Result<(), FlashError> {
-        if let Some(sales_code) = &self.options.sales_code {
-            progress::println(&format!("Setting device sales code to {}...", sales_code));
-            session.set_sales_code(sales_code).await?;
-        }
-
         if self.is_empty() {
+            self.set_sales_code(session).await?;
             if self.options.erase {
                 session.nand_erase().await?;
             }
@@ -510,6 +506,7 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashBl
             let local_pit = PitData::new(&pit_bytes).map_err(FlashError::PitUnpackFailed)?;
             self.resolve(&local_pit, false).await?;
 
+            self.set_sales_code(session).await?;
             if self.options.erase {
                 session.nand_erase().await?;
             }
@@ -524,6 +521,7 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashBl
             device_pit = download_pit(session).await?;
             let resolved = self.resolve(&device_pit, true).await?;
 
+            self.set_sales_code(session).await?;
             if self.options.erase {
                 session.nand_erase().await?;
             }
@@ -532,6 +530,14 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashBl
 
         let super_used_size = self.super_used_size(&resolved).await;
         self.flash(session, resolved, super_used_size).await
+    }
+
+    async fn set_sales_code(&self, session: &mut OdinSession) -> Result<(), FlashError> {
+        if let Some(sales_code) = &self.options.sales_code {
+            progress::println(&format!("Setting device sales code to {}...", sales_code));
+            session.set_sales_code(sales_code).await?;
+        }
+        Ok(())
     }
 
     /// Matches images to the entries of `pit_data`, applies overrides, skips and
@@ -2015,5 +2021,68 @@ mod tests {
         let _ = |blueprint: FlashBlueprint, session: &mut OdinSession| {
             assert_send(&blueprint.execute(session));
         };
+    }
+
+    #[test]
+    fn test_execute_sets_sales_code_after_resolving() {
+        let tar_bytes = build_tar(&[("boot.img", b"DUMMY BOOT IMAGE DATA")]);
+        let pit_bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test-data/Q7MQ_EUR_OPENX.pit"
+        ));
+        let csc = || MockEvent::SalesCode("XAA".to_string());
+
+        let run = |pit: Option<&[u8]>, packages: bool, skip: &[&str]| {
+            futures::executor::block_on(async {
+                let backend = MockBackend::new();
+                let events = backend.event_log();
+                let mut connection = OdinConnection::new(Box::new(backend));
+                connection.init().await.unwrap();
+                let mut session = connection.begin_session().await.unwrap();
+
+                let mut config = FlashConfig::new()
+                    .sales_code(Some("XAA"))
+                    .erase(true)
+                    .skip(skip);
+                if let Some(pit) = pit {
+                    config = config.pit(pit);
+                }
+                let packages = packages.then(|| ("AP.tar", Cursor::new(tar_bytes.as_slice())));
+                let res = config.packages(packages).run(&mut session).await;
+                let logged = events.lock().unwrap().clone();
+                (res, logged)
+            })
+        };
+
+        // Without a local PIT: after the device PIT is read and resolved
+        let (res, logged) = run(None, true, &[]);
+        assert!(res.is_ok());
+        assert_eq!(
+            logged[..3],
+            [MockEvent::PitDump, csc(), MockEvent::NandErase]
+        );
+
+        // With a local PIT: after the dry run, before anything is written
+        let (res, logged) = run(Some(pit_bytes), true, &[]);
+        assert!(res.is_ok());
+        assert_eq!(
+            logged[..4],
+            [
+                csc(),
+                MockEvent::NandErase,
+                MockEvent::PitFlash,
+                MockEvent::PitDump
+            ]
+        );
+
+        // Nothing to flash: first
+        let (res, logged) = run(None, false, &[]);
+        assert!(res.is_ok());
+        assert_eq!(logged, [csc(), MockEvent::NandErase]);
+
+        // Resolving fails: never set
+        let (res, logged) = run(None, true, &["nonexistent"]);
+        assert!(matches!(res, Err(FlashError::SkipTargetNotFound(_))));
+        assert_eq!(logged, [MockEvent::PitDump]);
     }
 }

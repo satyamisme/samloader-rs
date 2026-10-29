@@ -46,6 +46,8 @@ pub enum MockEvent {
     PitFlash,
     /// PIT dumped from the device.
     PitDump,
+    /// CSC / sales code set on the device.
+    SalesCode(String),
     /// A committed slice (raw or LZ4-compressed bytes as sent) for a partition.
     Slice {
         /// The numeric partition ID targeted by the slice.
@@ -653,7 +655,12 @@ impl UsbTransfer for MockBackend {
                                     self.packet_size = size as usize;
                                     self.push_response(CMD_SESSION_INIT, 0);
                                 }
-                                SessionCommand::SalesCode { .. } => {
+                                SessionCommand::SalesCode { c0, c1, c2 } => {
+                                    let code = [c0, c1, c2].map(|c| char::from(c as u8));
+                                    self.event_log
+                                        .lock()
+                                        .unwrap()
+                                        .push(MockEvent::SalesCode(code.iter().collect()));
                                     self.push_response(CMD_SESSION_INIT, 0);
                                 }
                                 SessionCommand::NandErase => {
