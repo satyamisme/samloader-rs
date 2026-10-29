@@ -550,8 +550,9 @@ impl OdinSession {
                 self.bootloader_protocol_version,
             );
 
-            self.transmit_slice(&init_cmd, &start_cmd, &end_cmd, slice_data)
+            self.transmit_slice_data(&init_cmd, &start_cmd, slice_data)
                 .await?;
+            self.commit_slice(&end_cmd).await?;
         }
 
         Ok(())
@@ -588,18 +589,20 @@ impl OdinSession {
                 self.bootloader_protocol_version,
             );
 
-            self.transmit_slice(&init_cmd, &start_cmd, &end_cmd, &slice_data)
+            self.transmit_slice_data(&init_cmd, &start_cmd, &slice_data)
                 .await?;
+            self.commit_slice(&end_cmd).await?;
         }
 
         Ok(())
     }
 
-    async fn transmit_slice(
+    /// Starts a slice transfer and sends its data in packets, leaving the slice
+    /// to be committed with [`commit_slice`](Self::commit_slice).
+    async fn transmit_slice_data(
         &mut self,
         init_cmd: &Command,
         start_cmd: &Command,
-        end_cmd: &Command,
         slice_data: &[u8],
     ) -> Result<(), OdinError> {
         let init_val = self.request_and_response(init_cmd, 3000).await?;
@@ -653,6 +656,12 @@ impl OdinSession {
             progress::inc(chunk_buffer.len() as u64);
         }
 
+        Ok(())
+    }
+
+    /// Commits a slice whose data was sent with
+    /// [`transmit_slice_data`](Self::transmit_slice_data).
+    async fn commit_slice(&mut self, end_cmd: &Command) -> Result<(), OdinError> {
         let end_val = self
             .request_and_response(end_cmd, self.slice_timeout as i32)
             .await?;
