@@ -58,7 +58,7 @@ impl UsbBackend for SerialBackend {
             .timeout(Duration::from_millis(1000))
             .open()
             .map_err(|e| {
-                OdinError::SerialError(format!("Failed to open port {}: {}", device.port_name, e))
+                OdinError::Transport(format!("Failed to open port {}: {}", device.port_name, e))
             })?;
 
         Ok(Self { port, product })

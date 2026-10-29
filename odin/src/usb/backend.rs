@@ -81,7 +81,7 @@ impl TryFrom<&str> for UsbBackendOption {
             "nusb" => Ok(UsbBackendOption::Nusb),
             #[cfg(mock_backend)]
             "mock" => Ok(UsbBackendOption::Mock),
-            _ => Err(OdinError::ParseError(format!("Unknown USB backend: {s}"))),
+            _ => Err(OdinError::UnknownBackend(s.to_string())),
         }
     }
 }

@@ -113,13 +113,17 @@ pub enum OdinError {
     #[error("{0}")]
     Loke(#[from] LokeError),
 
-    /// An error occurred on the serial/VCOM communication port.
-    #[error("Serial port error: {0}")]
-    SerialError(String),
+    /// The USB or serial transport could not be set up or failed to transfer data.
+    #[error("USB transport error: {0}")]
+    Transport(String),
 
-    /// An error occurred while parsing structures or headers.
+    /// A response packet from the device is malformed.
     #[error("{0}")]
-    ParseError(String),
+    InvalidResponse(String),
+
+    /// The name does not match any USB backend enabled in this build.
+    #[error("Unknown USB backend: {0}")]
+    UnknownBackend(String),
 
     /// Device diagnostics (DVIF / 0x69) are not supported or unavailable on this device.
     #[error("Device information is not available on this device.")]

@@ -298,8 +298,8 @@ impl OdinSession {
             return Err(OdinError::ReceivePacketFailed);
         }
 
-        let parsed =
-            Response::parse(&buffer[..received_size as usize]).map_err(OdinError::ParseError)?;
+        let parsed = Response::parse(&buffer[..received_size as usize])
+            .map_err(OdinError::InvalidResponse)?;
         progress::println_verbose(&format!("Received response: {:#04X?}", parsed));
         Ok(parsed)
     }

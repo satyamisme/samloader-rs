@@ -263,7 +263,9 @@ pub async fn reboot_download(usb_backend: UsbBackendOption) -> Result<(), OdinEr
     let cmd: &[u8] = b"AT+SUDDLMOD=0,0\r";
 
     if !backend.send_data(cmd, 1000).await {
-        return Err(OdinError::SerialError("Failed to send data".to_string()));
+        return Err(OdinError::Transport(
+            "Failed to send the reboot command".to_string(),
+        ));
     }
 
     Ok(())

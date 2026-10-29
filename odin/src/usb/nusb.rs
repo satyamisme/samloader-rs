@@ -251,10 +251,10 @@ impl UsbBackend for NusbBackend {
 
         let ep_in = interface
             .endpoint::<::nusb::transfer::Bulk, ::nusb::transfer::In>(in_endpoint)
-            .map_err(|e| OdinError::SerialError(format!("Failed to open IN endpoint: {}", e)))?;
+            .map_err(|e| OdinError::Transport(format!("Failed to open IN endpoint: {}", e)))?;
         let ep_out = interface
             .endpoint::<::nusb::transfer::Bulk, ::nusb::transfer::Out>(out_endpoint)
-            .map_err(|e| OdinError::SerialError(format!("Failed to open OUT endpoint: {}", e)))?;
+            .map_err(|e| OdinError::Transport(format!("Failed to open OUT endpoint: {}", e)))?;
 
         let product = device.product_string().map(|s| s.to_string());
 

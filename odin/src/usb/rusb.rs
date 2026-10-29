@@ -181,9 +181,8 @@ impl UsbBackend for RusbBackend {
     where
         F: FnMut(u16, u16) -> bool + MaybeSend + 'a,
     {
-        let context = Context::new().map_err(|e| {
-            OdinError::SerialError(format!("Failed to create libusb context: {}", e))
-        })?;
+        let context = Context::new()
+            .map_err(|e| OdinError::Transport(format!("Failed to create libusb context: {}", e)))?;
 
         if let Ok(devices) = context.devices() {
             for device in devices.iter() {
