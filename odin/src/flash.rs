@@ -15,7 +15,7 @@
 // limitations under the License.
 
 use crate::FlashError;
-use crate::avb;
+use crate::firmware::avb;
 use crate::firmware::{
     FirmwareImage, FirmwarePartitionPayload, FirmwareReaders, ImageSource, PackageIndex,
     normalize_basename, verify_md5_footer,
@@ -1030,7 +1030,7 @@ mod tests {
 
     #[test]
     fn test_rewrite_vbmeta_payloads_patches_all_vbmeta() {
-        use crate::avb::tests::{vbmeta_flags, vbmeta_image};
+        use crate::firmware::avb::tests::{vbmeta_flags, vbmeta_image};
 
         let pit_data = ab_pit_data();
         let image = vbmeta_image(0);
@@ -1105,7 +1105,7 @@ mod tests {
     #[test]
     fn test_rewrite_vbmeta_payloads_disabled_keeps_payloads() {
         let pit_data = ab_pit_data();
-        let (lz4_bytes, header) = lz4_compress(&crate::avb::tests::vbmeta_image(0));
+        let (lz4_bytes, header) = lz4_compress(&crate::firmware::avb::tests::vbmeta_image(0));
         let size = lz4_bytes.len() as u64;
         let mut planned = vec![FirmwarePartitionPayload {
             pit_entry: find_entry(&pit_data, "VBMETA_A"),
@@ -1154,7 +1154,7 @@ mod tests {
 
     #[test]
     fn test_rewrite_vbmeta_payloads_boot_without_vbmeta_partition() {
-        use crate::avb::tests::vbmeta_flags;
+        use crate::firmware::avb::tests::vbmeta_flags;
 
         // M3_EUR_OPEN_4G.pit has no vbmeta partition, so the vbmeta in boot's footer
         // is rewritten. A boot image without an AVB footer is rejected.
@@ -1225,7 +1225,7 @@ mod tests {
                 ("boot.img", b"DUMMY BOOT IMAGE DATA"),
             ])
         };
-        let valid = build_package(&crate::avb::tests::vbmeta_image(0));
+        let valid = build_package(&crate::firmware::avb::tests::vbmeta_image(0));
         let invalid = build_package(&[0u8; 4096]);
 
         let run = |name: &str, tar_bytes: &[u8], verity: bool| {
@@ -1440,7 +1440,7 @@ mod tests {
     fn test_execute_vbmeta_payload_flags() {
         use std::io::Write;
 
-        let raw_vbmeta = crate::avb::tests::vbmeta_image(0);
+        let raw_vbmeta = crate::firmware::avb::tests::vbmeta_image(0);
         let mut encoder = lz4_flex::frame::FrameEncoder::with_frame_info(
             lz4_flex::frame::FrameInfo::new()
                 .content_size(Some(raw_vbmeta.len() as u64))
@@ -1718,8 +1718,8 @@ mod tests {
 
     #[test]
     fn test_preplan_inspects_super_images() {
-        let super_img = crate::lp::tests::build_test_raw_image(&[(2048, 0, 4096)]);
-        let expected = crate::lp::inspect_super_bytes(&super_img);
+        let super_img = crate::firmware::lp::tests::build_test_raw_image(&[(2048, 0, 4096)]);
+        let expected = crate::firmware::lp::inspect_super_bytes(&super_img);
         assert!(expected.is_some());
 
         let tar_bytes = build_tar(&[("super.img", &super_img)]);
@@ -1758,7 +1758,7 @@ mod tests {
 
     #[test]
     fn test_super_used_size_inspects_partition_id_targets() {
-        let super_img = crate::lp::tests::build_test_raw_image(&[(2048, 0, 4096)]);
+        let super_img = crate::firmware::lp::tests::build_test_raw_image(&[(2048, 0, 4096)]);
         let pit_data = ab_pit_data();
         let super_id = find_entry(&pit_data, "SUPER").partition_id;
 
@@ -1777,7 +1777,7 @@ mod tests {
             let resolved = blueprint.resolve(&pit_data, true).await.unwrap();
             assert_eq!(
                 blueprint.super_used_size(&resolved).await,
-                crate::lp::inspect_super_bytes(&super_img)
+                crate::firmware::lp::inspect_super_bytes(&super_img)
             );
         });
     }

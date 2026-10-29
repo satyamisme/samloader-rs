@@ -14,9 +14,12 @@
 
 //! Parsing and reading of firmware packages and the images inside them.
 
+pub(crate) mod avb;
 mod image;
+pub(crate) mod lp;
 mod lz4;
 mod package;
+mod tar;
 
 pub(crate) use image::{FirmwareImage, FirmwarePartitionPayload, FirmwareReaders, ImageSource};
 #[cfg(test)]

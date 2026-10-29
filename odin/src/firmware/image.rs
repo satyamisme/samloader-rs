@@ -14,8 +14,8 @@
 
 //! Firmware images: where their bytes are stored and how to read them.
 
+use super::lp;
 use super::lz4::{self, Lz4FrameHeader};
-use crate::lp;
 use futures::StreamExt;
 use futures::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, Cursor};
 use futures::stream::{self, Stream};

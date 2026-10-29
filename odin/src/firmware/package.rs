@@ -14,9 +14,9 @@
 
 //! TAR firmware packages: MD5 footer verification and indexing of their files.
 
+use super::tar::TarArchive;
 use crate::FlashError;
 use crate::progress::{self, FlashEvent};
-use crate::tar::TarArchive;
 use fast_md5::Md5;
 use futures::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt};
 use std::collections::HashSet;
