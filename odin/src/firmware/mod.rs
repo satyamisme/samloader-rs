@@ -26,19 +26,3 @@ pub(crate) use image::{FirmwareImage, FirmwarePartitionPayload, FirmwareReaders,
 pub(crate) use lz4::Lz4FrameHeader;
 pub use package::verify_md5_footer;
 pub(crate) use package::{PackageIndex, normalize_basename};
-
-#[cfg(test)]
-pub(crate) mod tests {
-    pub(crate) fn build_tar(files: &[(&str, &[u8])]) -> Vec<u8> {
-        let mut builder = tar::Builder::new(Vec::new());
-        for &(path, content) in files {
-            let mut header = tar::Header::new_gnu();
-            header.set_size(content.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            builder.append_data(&mut header, path, content).unwrap();
-        }
-        builder.finish().unwrap();
-        builder.into_inner().unwrap()
-    }
-}

@@ -309,7 +309,7 @@ pub(crate) fn normalize_basename(path_str: &str) -> (String, bool) {
 mod tests {
     use super::*;
     use crate::FlashProgress;
-    use crate::firmware::tests::build_tar;
+    use crate::test_util::build_tar;
     use futures::io::Cursor;
     use std::fmt::Write;
     use std::sync::Arc;

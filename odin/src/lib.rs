@@ -31,6 +31,9 @@ mod progress;
 mod protocol;
 mod usb;
 
+#[cfg(test)]
+mod test_util;
+
 pub use device_info::{DeviceInfo, SessionDeviceInfo};
 pub use error::{FlashError, LokeError, OdinError};
 pub use firmware::verify_md5_footer;

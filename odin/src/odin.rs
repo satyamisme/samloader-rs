@@ -745,15 +745,13 @@ pub async fn query_device_info(
 mod tests {
     use super::*;
     use crate::protocol::CMD_SESSION_INIT;
+    use crate::test_util::mock_session;
     use crate::usb::MockBackend;
 
     #[test]
     fn test_odin_mock_multi_slice_transfer() {
         futures::executor::block_on(async {
-            let backend = Box::new(MockBackend::new());
-            let mut connection = OdinConnection::new(backend);
-            assert!(connection.init().await.is_ok());
-            let mut session = connection.begin_session().await.unwrap();
+            let mut session = mock_session(MockBackend::new()).await;
 
             let pit_entry = PitEntry {
                 binary_type: samloader_pit::BinaryType::ApplicationProcessor,
@@ -794,10 +792,7 @@ mod tests {
     #[test]
     fn test_odin_mock_set_sales_code() {
         futures::executor::block_on(async {
-            let backend = Box::new(MockBackend::new());
-            let mut connection = OdinConnection::new(backend);
-            assert!(connection.init().await.is_ok());
-            let mut session = connection.begin_session().await.unwrap();
+            let mut session = mock_session(MockBackend::new()).await;
 
             assert!(session.set_sales_code("TUR").await.is_ok());
 

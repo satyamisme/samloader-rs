@@ -754,11 +754,10 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashBl
 mod tests {
     use super::*;
     use crate::OdinError;
-    use crate::firmware::Lz4FrameHeader;
-    use crate::firmware::tests::build_tar;
-    use crate::odin::OdinConnection;
+    use crate::test_util::{
+        M3_PIT, Q7MQ_PIT, ab_pit_data, build_tar, find_entry, lz4_compress, mock_session,
+    };
     use crate::usb::{MockBackend, MockEvent};
-    use samloader_pit::PitEntry;
 
     impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashConfig<P, I> {
         /// Pre-plans and executes the flash.
@@ -770,10 +769,7 @@ mod tests {
     #[test]
     fn test_flash_partitions_super_size_preflight_success() {
         futures::executor::block_on(async {
-            let backend = Box::new(MockBackend::new().with_protocol_version(3));
-            let mut connection = OdinConnection::new(backend);
-            connection.init().await.unwrap();
-            let mut session = connection.begin_session().await.unwrap();
+            let mut session = mock_session(MockBackend::new().with_protocol_version(3)).await;
 
             let mut blueprint = FlashConfig::new().preplan().await.unwrap();
             blueprint.has_download_list = true;
@@ -790,14 +786,12 @@ mod tests {
     #[test]
     fn test_flash_partitions_super_size_preflight_rejection() {
         futures::executor::block_on(async {
-            let backend = Box::new(
+            let mut session = mock_session(
                 MockBackend::new()
                     .with_protocol_version(3)
                     .with_fail_check_super_size(-1),
-            );
-            let mut connection = OdinConnection::new(backend);
-            connection.init().await.unwrap();
-            let mut session = connection.begin_session().await.unwrap();
+            )
+            .await;
 
             let mut blueprint = FlashConfig::new().preplan().await.unwrap();
             blueprint.has_download_list = true;
@@ -813,14 +807,12 @@ mod tests {
     fn test_flash_partitions_super_size_preflight_skipped_on_legacy_protocol() {
         futures::executor::block_on(async {
             // Even if fail_check_super_size is set, legacy protocol version 2 must skip opcode 0x6a
-            let backend = Box::new(
+            let mut session = mock_session(
                 MockBackend::new()
                     .with_protocol_version(2)
                     .with_fail_check_super_size(-1),
-            );
-            let mut connection = OdinConnection::new(backend);
-            connection.init().await.unwrap();
-            let mut session = connection.begin_session().await.unwrap();
+            )
+            .await;
 
             let mut blueprint = FlashConfig::new().preplan().await.unwrap();
             blueprint.has_download_list = true;
@@ -837,32 +829,17 @@ mod tests {
     #[test]
     fn test_download_and_parse_pit_flashes_available_pit() {
         futures::executor::block_on(async {
-            let backend = Box::new(MockBackend::new());
-            let mut connection = OdinConnection::new(backend);
-            connection.init().await.unwrap();
-            let mut session = connection.begin_session().await.unwrap();
+            let mut session = mock_session(MockBackend::new()).await;
 
-            let pit_bytes = include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/test-data/M3_EUR_OPEN_4G.pit"
-            ));
-            let local_pit = PitData::new(pit_bytes).unwrap();
+            let local_pit = PitData::new(M3_PIT).unwrap();
             assert_eq!(local_pit.cpu_bl_id.to_string_lossy(), "Mx-MDM");
 
-            session.send_pit_info(pit_bytes).await.unwrap();
+            session.send_pit_info(M3_PIT).await.unwrap();
             let pit_buffer = session.receive_pit_info().await.unwrap();
             let pit_data = PitData::new(&pit_buffer).unwrap();
             // M3_EUR_OPEN_4G.pit has Mx-MDM, verifying PIT was sent and updated device state
             assert_eq!(pit_data.cpu_bl_id.to_string_lossy(), "Mx-MDM");
         });
-    }
-
-    fn ab_pit_data() -> PitData {
-        PitData::new(include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/test-data/Q7MQ_EUR_OPENX.pit"
-        )))
-        .unwrap()
     }
 
     fn skipped_names(targets: &[&str]) -> Result<Vec<String>, FlashError> {
@@ -954,14 +931,12 @@ mod tests {
 
         let run = |skip: &[&str]| {
             futures::executor::block_on(async {
-                let backend = Box::new(
+                let mut session = mock_session(
                     MockBackend::with_profile(crate::usb::DeviceProfile::sm_f968b())
                         .with_protocol_version(3)
                         .with_fail_check_super_size(-1),
-                );
-                let mut connection = OdinConnection::new(backend);
-                connection.init().await.unwrap();
-                let mut session = connection.begin_session().await.unwrap();
+                )
+                .await;
                 FlashConfig::new()
                     .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
                     .skip(skip)
@@ -972,27 +947,6 @@ mod tests {
 
         assert!(matches!(run(&[]), Err(FlashError::SuperSizeCheckFailed(_))));
         assert!(run(&["super.img"]).is_ok());
-    }
-
-    fn lz4_compress(data: &[u8]) -> (Vec<u8>, Lz4FrameHeader) {
-        use lz4_flex::frame::{BlockMode, BlockSize, FrameEncoder, FrameInfo};
-        use std::io::Write;
-
-        let info = FrameInfo::new()
-            .content_size(Some(data.len() as u64))
-            .block_size(BlockSize::Max1MB)
-            .block_mode(BlockMode::Independent);
-        let mut encoder = FrameEncoder::with_frame_info(info, Vec::new());
-        encoder.write_all(data).unwrap();
-        let compressed = encoder.finish().unwrap();
-        let header =
-            futures::executor::block_on(Lz4FrameHeader::parse(Cursor::new(&compressed[..])))
-                .unwrap();
-        (compressed, header)
-    }
-
-    fn find_entry<'p>(pit_data: &'p PitData, name: &str) -> &'p PitEntry {
-        pit_data.find_entry_by_name(name).unwrap()
     }
 
     fn rewrite_vbmeta(
@@ -1158,11 +1112,7 @@ mod tests {
 
         // M3_EUR_OPEN_4G.pit has no vbmeta partition, so the vbmeta in boot's footer
         // is rewritten. A boot image without an AVB footer is rejected.
-        let pit_data = PitData::new(include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/test-data/M3_EUR_OPEN_4G.pit"
-        )))
-        .unwrap();
+        let pit_data = PitData::new(M3_PIT).unwrap();
 
         let mut boot = vec![0u8; 16 * 1024];
         boot[0x1000..0x1004].copy_from_slice(b"AVB0");
@@ -1207,18 +1157,8 @@ mod tests {
 
     #[test]
     fn test_execute_disable_verity_with_lz4_vbmeta() {
-        use std::io::Write;
-
         let build_package = |vbmeta: &[u8]| {
-            let mut encoder = lz4_flex::frame::FrameEncoder::with_frame_info(
-                lz4_flex::frame::FrameInfo::new()
-                    .content_size(Some(vbmeta.len() as u64))
-                    .block_size(lz4_flex::frame::BlockSize::Max1MB)
-                    .block_mode(lz4_flex::frame::BlockMode::Independent),
-                Vec::new(),
-            );
-            encoder.write_all(vbmeta).unwrap();
-            let vbmeta_lz4 = encoder.finish().unwrap();
+            let (vbmeta_lz4, _) = lz4_compress(vbmeta);
 
             build_tar(&[
                 ("vbmeta.img.lz4", &vbmeta_lz4),
@@ -1230,12 +1170,10 @@ mod tests {
 
         let run = |name: &str, tar_bytes: &[u8], verity: bool| {
             futures::executor::block_on(async {
-                let backend = Box::new(MockBackend::with_profile(
+                let mut session = mock_session(MockBackend::with_profile(
                     crate::usb::DeviceProfile::sm_f968b(),
-                ));
-                let mut connection = OdinConnection::new(backend);
-                connection.init().await.unwrap();
-                let mut session = connection.begin_session().await.unwrap();
+                ))
+                .await;
                 assert!(session.is_lz4_supported());
                 FlashConfig::new()
                     .packages([(name, Cursor::new(tar_bytes))])
@@ -1263,9 +1201,7 @@ mod tests {
         futures::executor::block_on(async {
             let backend = MockBackend::new();
             let events = backend.event_log();
-            let mut connection = OdinConnection::new(Box::new(backend));
-            connection.init().await.unwrap();
-            let mut session = connection.begin_session().await.unwrap();
+            let mut session = mock_session(backend).await;
 
             let res = FlashConfig::new()
                 .erase(true)
@@ -1292,9 +1228,7 @@ mod tests {
         futures::executor::block_on(async {
             let backend = MockBackend::new();
             let events = backend.event_log();
-            let mut connection = OdinConnection::new(Box::new(backend));
-            connection.init().await.unwrap();
-            let mut session = connection.begin_session().await.unwrap();
+            let mut session = mock_session(backend).await;
 
             let res = FlashConfig::new()
                 .erase(true)
@@ -1318,20 +1252,14 @@ mod tests {
     #[test]
     fn test_execute_invalid_vbmeta_does_not_flash_pit() {
         let tar_bytes = build_tar(&[("vbmeta.img", &[0xFFu8; 512])]);
-        let pit_bytes = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/test-data/Q7MQ_EUR_OPENX.pit"
-        ));
 
         futures::executor::block_on(async {
             let backend = MockBackend::new();
             let events = backend.event_log();
-            let mut connection = OdinConnection::new(Box::new(backend));
-            connection.init().await.unwrap();
-            let mut session = connection.begin_session().await.unwrap();
+            let mut session = mock_session(backend).await;
 
             let res = FlashConfig::new()
-                .pit(&pit_bytes[..])
+                .pit(Q7MQ_PIT)
                 .erase(true)
                 .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
                 .disable_verity(true)
@@ -1353,20 +1281,14 @@ mod tests {
     #[test]
     fn test_execute_order_with_local_pit() {
         let tar_bytes = build_tar(&[("boot.img", b"DUMMY BOOT IMAGE DATA")]);
-        let pit_bytes = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/test-data/Q7MQ_EUR_OPENX.pit"
-        ));
 
         futures::executor::block_on(async {
             let backend = MockBackend::new();
             let events = backend.event_log();
-            let mut connection = OdinConnection::new(Box::new(backend));
-            connection.init().await.unwrap();
-            let mut session = connection.begin_session().await.unwrap();
+            let mut session = mock_session(backend).await;
 
             FlashConfig::new()
-                .pit(&pit_bytes[..])
+                .pit(Q7MQ_PIT)
                 .erase(true)
                 .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
                 .run(&mut session)
@@ -1389,9 +1311,7 @@ mod tests {
         futures::executor::block_on(async {
             let backend = MockBackend::new();
             let events = backend.event_log();
-            let mut connection = OdinConnection::new(Box::new(backend));
-            connection.init().await.unwrap();
-            let mut session = connection.begin_session().await.unwrap();
+            let mut session = mock_session(backend).await;
 
             FlashConfig::new()
                 .erase(true)
@@ -1415,9 +1335,7 @@ mod tests {
         futures::executor::block_on(async {
             let backend = MockBackend::new();
             let events = backend.event_log();
-            let mut connection = OdinConnection::new(Box::new(backend));
-            connection.init().await.unwrap();
-            let mut session = connection.begin_session().await.unwrap();
+            let mut session = mock_session(backend).await;
 
             let res = FlashConfig::new()
                 .pit(b"invalid_pit_bytes")
@@ -1438,18 +1356,8 @@ mod tests {
 
     #[test]
     fn test_execute_vbmeta_payload_flags() {
-        use std::io::Write;
-
         let raw_vbmeta = crate::firmware::avb::tests::vbmeta_image(0);
-        let mut encoder = lz4_flex::frame::FrameEncoder::with_frame_info(
-            lz4_flex::frame::FrameInfo::new()
-                .content_size(Some(raw_vbmeta.len() as u64))
-                .block_size(lz4_flex::frame::BlockSize::Max1MB)
-                .block_mode(lz4_flex::frame::BlockMode::Independent),
-            Vec::new(),
-        );
-        encoder.write_all(&raw_vbmeta).unwrap();
-        let vbmeta_lz4 = encoder.finish().unwrap();
+        let (vbmeta_lz4, _) = lz4_compress(&raw_vbmeta);
 
         let tar_bytes = build_tar(&[("vbmeta.img.lz4", &vbmeta_lz4)]);
 
@@ -1457,9 +1365,7 @@ mod tests {
         futures::executor::block_on(async {
             let backend = MockBackend::with_profile(crate::usb::DeviceProfile::sm_f968b());
             let events = backend.event_log();
-            let mut connection = OdinConnection::new(Box::new(backend));
-            connection.init().await.unwrap();
-            let mut session = connection.begin_session().await.unwrap();
+            let mut session = mock_session(backend).await;
 
             FlashConfig::new()
                 .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
@@ -1490,9 +1396,7 @@ mod tests {
             let raw_tar = build_tar(&[("vbmeta.img", &raw_vbmeta)]);
             let backend = MockBackend::with_profile(crate::usb::DeviceProfile::sm_f968b());
             let events = backend.event_log();
-            let mut connection = OdinConnection::new(Box::new(backend));
-            connection.init().await.unwrap();
-            let mut session = connection.begin_session().await.unwrap();
+            let mut session = mock_session(backend).await;
 
             FlashConfig::new()
                 .packages([("AP.tar", Cursor::new(raw_tar.as_slice()))])
@@ -1517,9 +1421,7 @@ mod tests {
         futures::executor::block_on(async {
             let backend = MockBackend::with_profile(crate::usb::DeviceProfile::sm_f968b());
             let events = backend.event_log();
-            let mut connection = OdinConnection::new(Box::new(backend));
-            connection.init().await.unwrap();
-            let mut session = connection.begin_session().await.unwrap();
+            let mut session = mock_session(backend).await;
 
             FlashConfig::new()
                 .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
@@ -1561,23 +1463,16 @@ mod tests {
             ("boot.img", b"DUMMY BOOT IMAGE DATA"),
             ("dtbo.img", b"DUMMY DTBO IMAGE DATA"),
         ]);
-        let pit_bytes = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/test-data/Q7MQ_EUR_OPENX.pit"
-        ));
 
         let collector = Collector::default();
         crate::progress::set_progress(collector.clone());
         let res = futures::executor::block_on(async {
-            let backend = Box::new(MockBackend::new());
-            let mut connection = OdinConnection::new(backend);
-            connection.init().await.unwrap();
-            let mut session = connection.begin_session().await.unwrap();
+            let mut session = mock_session(MockBackend::new()).await;
 
             // The plan is checked against the local PIT and then rebuilt against the
             // flashed PIT, but informational messages must only be printed once
             FlashConfig::new()
-                .pit(&pit_bytes[..])
+                .pit(Q7MQ_PIT)
                 .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
                 .skip(&["DTBO"])
                 .run(&mut session)
@@ -1913,19 +1808,13 @@ mod tests {
     #[test]
     fn test_execute_sets_sales_code_after_resolving() {
         let tar_bytes = build_tar(&[("boot.img", b"DUMMY BOOT IMAGE DATA")]);
-        let pit_bytes = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/test-data/Q7MQ_EUR_OPENX.pit"
-        ));
         let csc = || MockEvent::SalesCode("XAA".to_string());
 
         let run = |pit: Option<&[u8]>, packages: bool, skip: &[&str]| {
             futures::executor::block_on(async {
                 let backend = MockBackend::new();
                 let events = backend.event_log();
-                let mut connection = OdinConnection::new(Box::new(backend));
-                connection.init().await.unwrap();
-                let mut session = connection.begin_session().await.unwrap();
+                let mut session = mock_session(backend).await;
 
                 let mut config = FlashConfig::new()
                     .sales_code(Some("XAA"))
@@ -1950,7 +1839,7 @@ mod tests {
         );
 
         // With a local PIT: after the dry run, before anything is written
-        let (res, logged) = run(Some(pit_bytes), true, &[]);
+        let (res, logged) = run(Some(Q7MQ_PIT), true, &[]);
         assert!(res.is_ok());
         assert_eq!(
             logged[..4],
