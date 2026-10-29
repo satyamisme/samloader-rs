@@ -28,35 +28,10 @@ use samloader_pit::{PitData, PitEntry};
 use std::collections::HashSet;
 use std::io::SeekFrom;
 
-/// Lists the file names (directory and `.lz4` suffix stripped) that would be
-/// considered for flashing from `packages`, honoring `download-list.txt`.
-/// Metadata files and PIT files are excluded. Useful for confirmation prompts
-/// before connecting to a device.
-///
-/// Readers are only accessed through absolute seeks, so they can be passed to
-/// [`FlashConfig::packages`] afterwards without rewinding.
-pub async fn package_flash_files<R: AsyncRead + AsyncSeek + Unpin>(
-    packages: &mut [(String, R)],
-) -> Result<Vec<String>, FlashError> {
-    let scan = PackageIndex::scan(packages, false).await?;
-    Ok(scan
-        .entries
-        .into_iter()
-        .map(|e| e.normalized_name)
-        .collect())
-}
-
-/// Returns whether flashing `names` would write the userdata partition, which
-/// wipes the device's data.
-///
-/// Each name is either a file name, such as those returned by
-/// [`package_flash_files`], or a partition name. Directories and `.lz4` suffixes
-/// are stripped. `skip` takes the same targets as [`FlashConfig::skip`].
-///
-/// As the device's PIT is not consulted, this is a name-based check meant for
-/// confirmation prompts before connecting to a device. Partitions given by
-/// numeric ID cannot be resolved.
-pub fn flashes_userdata(names: &[impl AsRef<str>], skip: &[impl AsRef<str>]) -> bool {
+// Returns whether flashing `names` would write the userdata partition. Each name
+// is either a file name or a partition name; directories and `.lz4` suffixes are
+// stripped. `skip` takes the same targets as `FlashConfig::skip`.
+fn flashes_userdata(names: &[impl AsRef<str>], skip: &[impl AsRef<str>]) -> bool {
     let is_skipped = |name: &str| {
         skip.iter().any(|target| {
             let target = target.as_ref().trim();
@@ -1681,35 +1656,6 @@ mod tests {
             assert!(slice.0, "unmodified vbmeta must preserve LZ4 passthrough");
             // Passthrough sends the LZ4 blocks between the 15 byte frame header and the EndMark
             assert_eq!(slice.1, &vbmeta_lz4[15..vbmeta_lz4.len() - 4]);
-        });
-    }
-
-    #[test]
-    fn test_package_flash_files_filtering_and_truncation() {
-        let manifest = b"boot.img\nsuper.img\n";
-        let pit_bytes = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/test-data/M3_EUR_OPEN_4G.pit"
-        ));
-        let tar_bytes = build_tar(&[
-            ("meta-data/download-list.txt", manifest),
-            ("meta-data/super_used_size.txt", b"12345\n"),
-            ("device.pit", pit_bytes),
-            ("boot.img.lz4", b"BOOT DATA"),
-            ("recovery.img.lz4", b"RECOVERY DATA"),
-        ]);
-
-        futures::executor::block_on(async {
-            let mut packages = vec![("AP.tar".to_string(), Cursor::new(tar_bytes.as_slice()))];
-            let files = package_flash_files(&mut packages).await.unwrap();
-            // recovery.img is omitted (not in download-list), metadata & pit are omitted
-            assert_eq!(files, ["boot.img"]);
-
-            // Truncated package errors on scan
-            let truncated = &tar_bytes[..tar_bytes.len() - 600];
-            let mut bad_packages = vec![("AP.tar".to_string(), Cursor::new(truncated))];
-            let res = package_flash_files(&mut bad_packages).await;
-            assert!(matches!(res, Err(FlashError::ArchiveCorrupted(pkg, _)) if pkg == "AP.tar"));
         });
     }
 

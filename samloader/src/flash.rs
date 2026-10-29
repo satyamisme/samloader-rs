@@ -19,9 +19,9 @@ use crate::print_error;
 use indicatif::{ProgressBar, ProgressStyle};
 use samloader_odin::{
     FlashConfig, FlashEvent, FlashProgress, OdinConnection, RebootMode, UsbBackendOption,
-    create_backend, flashes_userdata,
+    create_backend,
     futures::{executor::block_on, io::AllowStdIo},
-    package_flash_files, set_progress,
+    set_progress,
 };
 use std::error::Error;
 use std::fs::File;
@@ -242,38 +242,10 @@ fn flash(args: FlashArgs) -> Result<(), Box<dyn Error>> {
         force,
     } = args;
 
-    let mut opened_packages = packages
+    let opened_packages = packages
         .iter()
         .map(|pkg| Ok((pkg.clone(), open(pkg)?)))
         .collect::<Result<Vec<_>, String>>()?;
-
-    if !force {
-        let package_files = block_on(package_flash_files(&mut opened_packages))?;
-
-        let names: Vec<&str> = package_files
-            .iter()
-            .map(String::as_str)
-            .chain(
-                partitions
-                    .iter()
-                    .map(|p| p.name.as_deref().unwrap_or(&p.filename)),
-            )
-            .collect();
-
-        if flashes_userdata(&names, &skip) {
-            if !io::stdin().is_terminal() {
-                return Err(
-                    "Flash list contains userdata, which will wipe the device's data. \
-                            Pass --force to flash it without a terminal."
-                        .into(),
-                );
-            }
-            if !confirm("Flash list contains userdata. This will wipe the device's data. Continue?")
-            {
-                return Err("Flashing aborted by user.".into());
-            }
-        }
-    }
 
     let opened_partitions = partitions
         .iter()
@@ -288,31 +260,45 @@ fn flash(args: FlashArgs) -> Result<(), Box<dyn Error>> {
         None => None,
     };
 
+    let mut config = FlashConfig::new()
+        .reboot_mode(reboot_mode)
+        .skip_size_check(skip_size_check)
+        .skip_md5(skip_md5)
+        .erase(erase)
+        .packages(opened_packages)
+        .partitions(opened_partitions)
+        .skip(&skip)
+        .disable_verity(disable_verity)
+        .disable_verification(disable_verification)
+        .sales_code(csc_code.as_deref());
+
+    if let Some(buffer) = pit_bytes {
+        config = config.pit(buffer);
+    }
+
+    // Validate and index the inputs before connecting to the device
     set_progress(CliProgress::new(verbose));
+    let blueprint = block_on(config.preplan())?;
+
+    if !force && blueprint.flashes_userdata() {
+        if !io::stdin().is_terminal() {
+            return Err(
+                "Flash list contains userdata, which will wipe the device's data. \
+                        Pass --force to flash it without a terminal."
+                    .into(),
+            );
+        }
+        if !confirm("Flash list contains userdata. This will wipe the device's data. Continue?") {
+            return Err("Flashing aborted by user.".into());
+        }
+    }
 
     block_on(async {
         let usb = create_backend(usb_backend, wait).await?;
         let mut connection = OdinConnection::new(usb);
         connection.init().await?;
         let mut session = connection.begin_session().await?;
-
-        let mut config = FlashConfig::new()
-            .reboot_mode(reboot_mode)
-            .skip_size_check(skip_size_check)
-            .skip_md5(skip_md5)
-            .erase(erase)
-            .packages(opened_packages)
-            .partitions(opened_partitions)
-            .skip(&skip)
-            .disable_verity(disable_verity)
-            .disable_verification(disable_verification)
-            .sales_code(csc_code.as_deref());
-
-        if let Some(buffer) = pit_bytes {
-            config = config.pit(buffer);
-        }
-
-        config.preplan().await?.execute(&mut session).await?;
+        blueprint.execute(&mut session).await?;
         Ok(())
     })
 }

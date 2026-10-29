@@ -1066,4 +1066,37 @@ pub(crate) mod tests {
             assert!(matches!(result, Err(FlashError::ArchiveCorrupted(_, _))));
         });
     }
+
+    #[test]
+    fn test_package_index_filtering_and_truncation() {
+        let pit_bytes = b"PIT DATA";
+        let tar_bytes = build_tar(&[
+            ("meta-data/download-list.txt", b"boot.img\nsuper.img\n"),
+            ("meta-data/super_used_size.txt", b"12345\n"),
+            ("device.pit", pit_bytes),
+            ("boot.img.lz4", b"BOOT DATA"),
+            ("recovery.img.lz4", b"RECOVERY DATA"),
+        ]);
+
+        futures::executor::block_on(async {
+            let mut packages = [("AP.tar".to_string(), Cursor::new(tar_bytes.as_slice()))];
+            let index = PackageIndex::scan(&mut packages, true).await.unwrap();
+            // recovery.img is omitted (not in download-list), metadata & pit are omitted
+            let names: Vec<_> = index.entries.iter().map(|e| &e.normalized_name).collect();
+            assert_eq!(names, ["boot.img"]);
+            assert!(index.entries[0].is_lz4);
+            assert_eq!(index.super_used_size, Some(12345));
+            assert_eq!(index.pit_bytes.as_deref(), Some(&pit_bytes[..]));
+
+            // The PIT is only read when requested
+            let index = PackageIndex::scan(&mut packages, false).await.unwrap();
+            assert_eq!(index.pit_bytes, None);
+
+            // Truncated package errors on scan
+            let truncated = &tar_bytes[..tar_bytes.len() - 600];
+            let mut bad_packages = [("AP.tar".to_string(), Cursor::new(truncated))];
+            let res = PackageIndex::scan(&mut bad_packages, true).await;
+            assert!(matches!(res, Err(FlashError::ArchiveCorrupted(pkg, _)) if pkg == "AP.tar"));
+        });
+    }
 }
