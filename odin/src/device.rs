@@ -19,7 +19,7 @@
 
 use crate::device_info::DeviceInfo;
 use crate::error::OdinError;
-use crate::odin::OdinConnection;
+use crate::session::OdinConnection;
 use crate::usb::{UsbBackend, UsbBackendOption, UsbTransfer, with_backend};
 use std::time::Duration;
 

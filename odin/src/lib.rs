@@ -28,9 +28,9 @@ mod device_info;
 mod error;
 mod firmware;
 mod flash;
-mod odin;
 mod progress;
 mod protocol;
+mod session;
 mod usb;
 
 #[cfg(test)]
@@ -42,8 +42,8 @@ pub use device_info::{DeviceInfo, SessionDeviceInfo};
 pub use error::{FlashError, LokeError, OdinError};
 pub use firmware::verify_md5_footer;
 pub use flash::{FlashBlueprint, FlashConfig, RebootMode};
-pub use odin::{OdinConnection, OdinSession};
 pub use progress::{FlashEvent, FlashProgress, clear_progress, set_progress};
+pub use session::{OdinConnection, OdinSession};
 pub use usb::{UsbBackend, UsbBackendOption, UsbTransfer};
 
 #[cfg(target_arch = "wasm32")]

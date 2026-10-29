@@ -20,8 +20,8 @@ use crate::firmware::{
     FirmwareImage, FirmwarePartitionPayload, FirmwareReaders, ImageSource, PackageIndex,
     normalize_basename, verify_md5_footer,
 };
-use crate::odin::{OdinSession, parse_sales_code};
 use crate::progress::{self, FlashEvent};
+use crate::session::{OdinSession, parse_sales_code};
 use futures::io::{AsyncRead, AsyncSeek, AsyncSeekExt, Cursor};
 use samloader_pit::PitData;
 use std::collections::HashSet;

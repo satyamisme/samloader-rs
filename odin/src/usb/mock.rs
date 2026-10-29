@@ -868,7 +868,7 @@ impl UsbTransfer for MockBackend {
 mod tests {
     use super::*;
     use crate::error::OdinError;
-    use crate::odin::OdinConnection;
+    use crate::session::OdinConnection;
     use samloader_pit::BinaryType;
 
     #[test]

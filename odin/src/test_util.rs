@@ -15,7 +15,7 @@
 //! Helpers shared by the crate's tests.
 
 use crate::firmware::Lz4FrameHeader;
-use crate::odin::{OdinConnection, OdinSession};
+use crate::session::{OdinConnection, OdinSession};
 use crate::usb::MockBackend;
 use futures::io::Cursor;
 use samloader_pit::{PitData, PitEntry};

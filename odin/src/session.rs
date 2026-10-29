@@ -13,6 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! The Odin protocol connection and session with a device in Download Mode.
+
 use crate::device_info::{DeviceInfo, SessionDeviceInfo};
 use crate::error::{LokeError, OdinError};
 use crate::firmware::FirmwarePartitionPayload;
