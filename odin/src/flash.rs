@@ -28,24 +28,6 @@ use samloader_pit::{PitData, PitEntry};
 use std::collections::HashSet;
 use std::io::SeekFrom;
 
-// Returns whether flashing `names` would write the userdata partition. Each name
-// is either a file name or a partition name; directories and `.lz4` suffixes are
-// stripped. `skip` takes the same targets as `FlashConfig::skip`.
-fn flashes_userdata(names: &[impl AsRef<str>], skip: &[impl AsRef<str>]) -> bool {
-    let is_skipped = |name: &str| {
-        skip.iter().any(|target| {
-            let target = target.as_ref().trim();
-            target.eq_ignore_ascii_case("USERDATA")
-                || normalize_basename(target).0.eq_ignore_ascii_case(name)
-        })
-    };
-
-    names.iter().any(|name| {
-        let (name, _) = normalize_basename(name.as_ref());
-        name.to_ascii_lowercase().starts_with("userdata") && !is_skipped(&name)
-    })
-}
-
 fn find_pit_entry_by_filename<'a>(pit_data: &'a PitData, filename: &str) -> Option<&'a PitEntry> {
     pit_data.entries.iter().find(|e| {
         let flash_fn = e.flash_filename.to_string_lossy();
@@ -454,15 +436,20 @@ impl<P, I> FlashBlueprint<P, I> {
     /// honors the configured skip targets. Partitions given by numeric ID cannot
     /// be resolved.
     pub fn flashes_userdata(&self) -> bool {
-        let names: Vec<&str> = self
-            .images
-            .iter()
-            .filter_map(|planned| match &planned.target {
-                Target::File(name) | Target::Partition(name) => Some(name.as_str()),
-                Target::PartitionId(_) => None,
+        // Skip targets are file names or partition names, like in `resolve_skipped_partitions`
+        let is_skipped = |name: &str| {
+            self.options.skip.iter().any(|target| {
+                target.eq_ignore_ascii_case("USERDATA")
+                    || normalize_basename(target).0.eq_ignore_ascii_case(name)
             })
-            .collect();
-        flashes_userdata(&names, &self.options.skip)
+        };
+
+        self.images.iter().any(|planned| match &planned.target {
+            Target::File(name) | Target::Partition(name) => {
+                name.to_ascii_lowercase().starts_with("userdata") && !is_skipped(name)
+            }
+            Target::PartitionId(_) => false,
+        })
     }
 
     fn is_empty(&self) -> bool {
@@ -866,29 +853,6 @@ mod tests {
         async fn run(self, session: &mut OdinSession) -> Result<(), FlashError> {
             self.preplan().await?.execute(session).await
         }
-    }
-
-    #[test]
-    fn test_flashes_userdata() {
-        let none: &[&str] = &[];
-
-        // File names, ignoring directories and the .lz4 suffix, and partition names
-        assert!(flashes_userdata(&["boot.img", "userdata.img"], none));
-        assert!(flashes_userdata(&["dir/userdata.img.lz4"], none));
-        assert!(flashes_userdata(&["USERDATA"], none));
-        assert!(!flashes_userdata(&["boot.img", "super.img"], none));
-        assert!(!flashes_userdata(none, none));
-
-        // Skipped by partition name in any case, or by file name
-        assert!(!flashes_userdata(&["userdata.img"], &["userdata"]));
-        assert!(!flashes_userdata(&["USERDATA"], &[" USERDATA "]));
-        assert!(!flashes_userdata(
-            &["userdata.img"],
-            &["out/userdata.img.lz4"]
-        ));
-
-        // Skipping other partitions does not exclude userdata
-        assert!(flashes_userdata(&["userdata.img"], &["boot", "super.img"]));
     }
 
     #[test]
@@ -1914,6 +1878,8 @@ mod tests {
             ("userdata.img", b"DATA"),
         ]);
         let boot_tar = build_tar(&[("boot.img", b"BOOT")]);
+        let (userdata_lz4, _) = lz4_compress(b"DATA");
+        let lz4_tar = build_tar(&[("AP/userdata.img.lz4", &userdata_lz4)]);
 
         type Partitions<'a> = Vec<(Option<String>, &'a str, Cursor<&'a [u8]>)>;
         let flashes_userdata = |tar: &[u8], partitions: Partitions, skip: &[&str]| {
@@ -1937,7 +1903,9 @@ mod tests {
             vec![],
             &["out/userdata.img.lz4"]
         ));
-        assert!(flashes_userdata(&tar_bytes, vec![], &["boot"]));
+        assert!(flashes_userdata(&tar_bytes, vec![], &["boot", "super.img"]));
+        assert!(flashes_userdata(&lz4_tar, vec![], &[]));
+        assert!(!flashes_userdata(&lz4_tar, vec![], &["userdata.img"]));
         assert!(!flashes_userdata(&listed_tar, vec![], &[]));
         assert!(!flashes_userdata(&boot_tar, vec![], &[]));
         assert!(flashes_userdata(
@@ -1949,6 +1917,11 @@ mod tests {
             &boot_tar,
             vec![(Some("USERDATA".to_string()), "data.img", data())],
             &[]
+        ));
+        assert!(!flashes_userdata(
+            &boot_tar,
+            vec![(Some("USERDATA".to_string()), "data.img", data())],
+            &["userdata"]
         ));
         // Partition IDs cannot be resolved without a PIT
         assert!(!flashes_userdata(
