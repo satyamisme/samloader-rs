@@ -55,7 +55,6 @@ const SUPPORTED_DEVICES: &[(u16, u16)] = &[
 const USB_CLASS_CDC_DATA: u8 = 0x0A;
 
 /// Returns whether the VID/PID belongs to a Samsung device that is not in Download Mode.
-#[cfg(real_backend)]
 fn is_normal_mode_device(vid: u16, pid: u16) -> bool {
     vid == VID_SAMSUNG && !SUPPORTED_DEVICES.contains(&(vid, pid))
 }
@@ -65,7 +64,6 @@ fn is_normal_mode_device(vid: u16, pid: u16) -> bool {
 /// Unlike [`UsbBackend::find_device`], which returns only the first match, this
 /// moves on to the next match when a device fails to open, e.g. an unrelated
 /// device from the same vendor without a usable CDC data interface.
-#[cfg(real_backend)]
 async fn open_first_usable<B, P>(predicate: P) -> Result<B, OdinError>
 where
     B: UsbBackend,
@@ -119,7 +117,6 @@ where
 }
 
 /// Opens the first usable Samsung device that is not in Download Mode.
-#[cfg(real_backend)]
 async fn open_normal_mode_device<B: UsbBackend>() -> Result<B, OdinError> {
     match open_first_usable(is_normal_mode_device).await {
         Err(OdinError::DeviceNotFound) => Err(OdinError::NormalModeDeviceNotFound),
@@ -276,7 +273,10 @@ impl UsbBackendOption {
                 Ok(())
             }
             #[cfg(mock_backend)]
-            UsbBackendOption::Mock => Ok(()),
+            UsbBackendOption::Mock => {
+                MockBackend::find_download_device().await?;
+                Ok(())
+            }
         }
     }
 
@@ -302,7 +302,8 @@ impl UsbBackendOption {
             }
             #[cfg(mock_backend)]
             UsbBackendOption::Mock => {
-                let backend = MockBackend::new();
+                MockBackend::find_download_device().await?;
+                let backend = <MockBackend as UsbBackend>::new(()).await?;
                 Ok(Box::new(backend))
             }
         }
@@ -331,7 +332,7 @@ impl UsbBackendOption {
             }
             #[cfg(mock_backend)]
             UsbBackendOption::Mock => {
-                let backend = MockBackend::new();
+                let backend: MockBackend = open_normal_mode_device().await?;
                 Ok(Box::new(backend))
             }
         }
@@ -429,7 +430,7 @@ pub async fn request_reboot_device(usb_backend: UsbBackendOption) -> Result<(), 
     }
 }
 
-#[cfg(all(test, real_backend))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::RefCell;

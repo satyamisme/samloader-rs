@@ -15,12 +15,14 @@
 //! High-fidelity mock transport mimicking the Samsung Odin/Loke download mode protocol
 //! backed by reverse-engineered ground truth from real device bootloaders.
 
+use crate::compat::MaybeSend;
+use crate::error::OdinError;
 use crate::protocol::{
     CMD_CLOSE_CONNECTION, CMD_DDP, CMD_DEVINFO, CMD_PIT, CMD_SESSION_INIT, CMD_TRANSMIT,
     CloseConnectionCommand, Command, DeviceInfoCommand, DynamicPartitionCommand, PitCommand,
     STATUS_FAIL, STREAMING_CHUNK_ACK, SessionCommand, TransmitCommand,
 };
-use crate::usb::UsbTransfer;
+use crate::usb::{UsbBackend, UsbTransfer};
 use binrw::BinRead;
 use samloader_pit::PitData;
 use std::collections::VecDeque;
@@ -521,6 +523,25 @@ impl MockBackend {
         );
         self.outgoing_queue.extend(&response_type.to_le_bytes());
         self.outgoing_queue.extend(&value.to_le_bytes());
+    }
+}
+
+/// The mock device is always connected, so every lookup finds it regardless
+/// of the requested mode, and opening it yields a fresh default mock.
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+impl UsbBackend for MockBackend {
+    type UsbDevice = ();
+
+    async fn new(_device: Self::UsbDevice) -> Result<Self, OdinError> {
+        Ok(Self::new())
+    }
+
+    async fn find_device<'a, F>(_predicate: F) -> Result<Self::UsbDevice, OdinError>
+    where
+        F: FnMut(u16, u16) -> bool + MaybeSend + 'a,
+    {
+        Ok(())
     }
 }
 
