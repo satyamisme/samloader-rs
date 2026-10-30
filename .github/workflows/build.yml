@@ -34,13 +34,6 @@ jobs:
           rustup update
           rustup target add ${{ matrix.arch }}-unknown-linux-musl
 
-          # Get linux headers since musl does not include them
-          git clone https://github.com/sabotage-linux/kernel-headers.git
-          cd kernel-headers
-          make ARCH=${{ matrix.arch }} prefix=../linux-usr install
-          cd ../
-          export CFLAGS_${{ matrix.arch }}_unknown_linux_musl="-I $(readlink -f linux-usr/include)"
-
           # Build samloader
           cargo build -p samloader --target ${{ matrix.arch }}-unknown-linux-musl --release
           VERSION=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "samloader") | .version')
