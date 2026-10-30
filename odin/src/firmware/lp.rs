@@ -12,27 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Helper functions for inspecting Android Logical Partition (`liblp`) metadata
-//! and sparse image containers to derive dynamic partition sizing.
+//! Helper functions for inspecting Samsung's Data Dynamic Partition (DDP) header
+//! in Android Logical Partition (`super.img`) images.
 
 const SPARSE_HEADER_MAGIC: u32 = 0xed26_ff3a;
 const CHUNK_RAW: u16 = 0xcac1;
 const CHUNK_FILL: u16 = 0xcac2;
 
-const LP_METADATA_GEOMETRY_MAGIC: u32 = 0x616c_4467; // "gDal"
-const LP_METADATA_HEADER_MAGIC: u32 = 0x414c_5030; // "0PLA"
-const LP_TARGET_TYPE_LINEAR: u32 = 0;
+const LP_METADATA_GEOMETRY_MAGIC: u32 = 0x616c_4467; // "gDla"
 
+const DDP_SUPER_USED_SIZE_OFFSET: usize = 0x400;
 const LP_GEOMETRY_OFFSET: usize = 0x1000;
-const LP_PRIMARY_HEADER_OFFSET: usize = 0x3000;
-const REQUIRED_LOGICAL_SIZE: usize = 256 * 1024;
+const REQUIRED_LOGICAL_SIZE: usize = LP_GEOMETRY_OFFSET + 4;
 
 /// Number of bytes at the start of a (possibly sparse) super image that are needed
-/// to parse its LP metadata.
-pub(crate) const SUPER_METADATA_PREFIX_SIZE: usize = 512 * 1024;
+/// to read its DDP header and verify its LP geometry magic.
+pub(crate) const SUPER_METADATA_PREFIX_SIZE: usize = 16 * 1024;
 
-/// Inspects the raw or sparse bytes at the start of a `super.img` and extracts the highest
-/// allocated sector defined across all linear dynamic partition extents.
+/// Inspects the raw or sparse bytes at the start of a `super.img` and extracts
+/// Samsung's non-standard DDP `super_used_size` (in 512-byte sectors), if present.
 pub(crate) fn inspect_super_bytes(data: &[u8]) -> Option<u32> {
     if data.len() < 4 {
         return None;
@@ -41,9 +39,9 @@ pub(crate) fn inspect_super_bytes(data: &[u8]) -> Option<u32> {
     let magic = u32::from_le_bytes(data[0..4].try_into().ok()?);
     if magic == SPARSE_HEADER_MAGIC {
         let logical_data = unsparse_prefix(data, REQUIRED_LOGICAL_SIZE)?;
-        parse_lp_metadata(&logical_data)
+        parse_super_used_size(&logical_data)
     } else {
-        parse_lp_metadata(data)
+        parse_super_used_size(data)
     }
 }
 
@@ -100,9 +98,16 @@ fn unsparse_prefix(data: &[u8], target_size: usize) -> Option<Vec<u8>> {
     Some(logical_buf)
 }
 
-/// Parses the primary `liblp` metadata tables and computes the maximum extent end sector.
-fn parse_lp_metadata(raw: &[u8]) -> Option<u32> {
-    if raw.len() < LP_PRIMARY_HEADER_OFFSET + 104 {
+/// Verifies the `liblp` geometry magic at `0x1000` and reads Samsung's DDP
+/// `super_used_size` field at `0x400`.
+///
+/// Upstream `liblp` reserves the first 4096 bytes (`0x0000..0x0fff`) of `super` as zeroes.
+/// On devices with Data Dynamic Partition (DDP), Samsung writes `super_used_size` (in
+/// 512-byte sectors) as a little-endian `u32` at offset `0x400`, which the bootloader's
+/// `GetSuperUsedSizeFromImage` reads during flashing. Non-DDP Samsung images and standard
+/// `lpmake` images leave offset `0x400` as `0`.
+fn parse_super_used_size(raw: &[u8]) -> Option<u32> {
+    if raw.len() < REQUIRED_LOGICAL_SIZE {
         return None;
     }
 
@@ -116,110 +121,37 @@ fn parse_lp_metadata(raw: &[u8]) -> Option<u32> {
         return None;
     }
 
-    // Verify primary metadata header magic
-    let hdr_magic = u32::from_le_bytes(
-        raw[LP_PRIMARY_HEADER_OFFSET..LP_PRIMARY_HEADER_OFFSET + 4]
+    let used_size = u32::from_le_bytes(
+        raw[DDP_SUPER_USED_SIZE_OFFSET..DDP_SUPER_USED_SIZE_OFFSET + 4]
             .try_into()
             .ok()?,
     );
-    if hdr_magic != LP_METADATA_HEADER_MAGIC {
-        return None;
-    }
 
-    let hdr_size = u32::from_le_bytes(
-        raw[LP_PRIMARY_HEADER_OFFSET + 8..LP_PRIMARY_HEADER_OFFSET + 12]
-            .try_into()
-            .ok()?,
-    ) as usize;
-
-    let tables_start = LP_PRIMARY_HEADER_OFFSET.checked_add(hdr_size)?;
-
-    // Extents table descriptor is at offset 92 from the start of the header
-    let ext_desc_offset = LP_PRIMARY_HEADER_OFFSET + 92;
-    let ext_offset =
-        u32::from_le_bytes(raw[ext_desc_offset..ext_desc_offset + 4].try_into().ok()?) as usize;
-    let ext_num = u32::from_le_bytes(
-        raw[ext_desc_offset + 4..ext_desc_offset + 8]
-            .try_into()
-            .ok()?,
-    ) as usize;
-    let ext_entry_size = u32::from_le_bytes(
-        raw[ext_desc_offset + 8..ext_desc_offset + 12]
-            .try_into()
-            .ok()?,
-    ) as usize;
-
-    if ext_entry_size < 24 {
-        return None;
-    }
-
-    let mut max_sector: u64 = 0;
-    let extents_base = tables_start.checked_add(ext_offset)?;
-
-    for e in 0..ext_num {
-        let pos = extents_base.checked_add(e.checked_mul(ext_entry_size)?)?;
-        if pos + 20 > raw.len() {
-            break;
-        }
-
-        let num_sectors = u64::from_le_bytes(raw[pos..pos + 8].try_into().ok()?);
-        let target_type = u32::from_le_bytes(raw[pos + 8..pos + 12].try_into().ok()?);
-        let target_data = u64::from_le_bytes(raw[pos + 12..pos + 20].try_into().ok()?);
-
-        if target_type == LP_TARGET_TYPE_LINEAR {
-            let end_sector = target_data.checked_add(num_sectors)?;
-            if end_sector > max_sector {
-                max_sector = end_sector;
-            }
-        }
-    }
-
-    if max_sector > 0 {
-        u32::try_from(max_sector).ok()
-    } else {
-        None
-    }
+    (used_size > 0).then_some(used_size)
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
 
-    pub(crate) fn build_test_raw_image(extents: &[(u64, u32, u64)]) -> Vec<u8> {
-        let mut raw = vec![0u8; 128 * 1024];
+    pub(crate) fn build_test_raw_image(super_used_size: u32) -> Vec<u8> {
+        let mut raw = vec![0u8; 8 * 1024];
+
+        // Samsung DDP super_used_size at 0x400
+        raw[DDP_SUPER_USED_SIZE_OFFSET..DDP_SUPER_USED_SIZE_OFFSET + 4]
+            .copy_from_slice(&super_used_size.to_le_bytes());
 
         // Geometry at 0x1000
-        raw[0x1000..0x1004].copy_from_slice(&LP_METADATA_GEOMETRY_MAGIC.to_le_bytes());
-
-        // Header at 0x3000
-        raw[0x3000..0x3004].copy_from_slice(&LP_METADATA_HEADER_MAGIC.to_le_bytes());
-        let hdr_size: u32 = 256;
-        raw[0x3008..0x300c].copy_from_slice(&hdr_size.to_le_bytes());
-
-        // Extents descriptor at 0x3000 + 92
-        let ext_desc_offset = 0x3000 + 92;
-        let ext_offset: u32 = 0;
-        let ext_num = extents.len() as u32;
-        let ext_entry_size: u32 = 24;
-        raw[ext_desc_offset..ext_desc_offset + 4].copy_from_slice(&ext_offset.to_le_bytes());
-        raw[ext_desc_offset + 4..ext_desc_offset + 8].copy_from_slice(&ext_num.to_le_bytes());
-        raw[ext_desc_offset + 8..ext_desc_offset + 12]
-            .copy_from_slice(&ext_entry_size.to_le_bytes());
-
-        let tables_start = 0x3000 + hdr_size as usize;
-        for (i, &(num_sectors, target_type, target_data)) in extents.iter().enumerate() {
-            let pos = tables_start + i * 24;
-            raw[pos..pos + 8].copy_from_slice(&num_sectors.to_le_bytes());
-            raw[pos + 8..pos + 12].copy_from_slice(&target_type.to_le_bytes());
-            raw[pos + 12..pos + 20].copy_from_slice(&target_data.to_le_bytes());
-        }
+        raw[LP_GEOMETRY_OFFSET..LP_GEOMETRY_OFFSET + 4]
+            .copy_from_slice(&LP_METADATA_GEOMETRY_MAGIC.to_le_bytes());
 
         raw
     }
 
     fn build_test_sparse_image(raw_payload: &[u8]) -> Vec<u8> {
-        let blk_sz = 4096u32;
-        let num_blks = (raw_payload.len() as u32) / blk_sz;
+        let blk_sz = 4096usize;
+        let chunks: Vec<&[u8]> = raw_payload.chunks(blk_sz).collect();
+        let total_blks = chunks.len() as u32;
         let mut sparse = Vec::new();
 
         // Sparse header (28 bytes)
@@ -228,35 +160,39 @@ pub(crate) mod tests {
         sparse.extend_from_slice(&0u16.to_le_bytes()); // minor
         sparse.extend_from_slice(&28u16.to_le_bytes()); // file_hdr_sz
         sparse.extend_from_slice(&12u16.to_le_bytes()); // chunk_hdr_sz
-        sparse.extend_from_slice(&blk_sz.to_le_bytes()); // blk_sz
-        sparse.extend_from_slice(&num_blks.to_le_bytes()); // total_blks
-        sparse.extend_from_slice(&1u32.to_le_bytes()); // total_chunks
+        sparse.extend_from_slice(&(blk_sz as u32).to_le_bytes()); // blk_sz
+        sparse.extend_from_slice(&total_blks.to_le_bytes()); // total_blks
+        sparse.extend_from_slice(&(chunks.len() as u32).to_le_bytes()); // total_chunks
         sparse.extend_from_slice(&0u32.to_le_bytes()); // image_checksum
 
-        // Chunk header (12 bytes)
-        sparse.extend_from_slice(&CHUNK_RAW.to_le_bytes());
-        sparse.extend_from_slice(&0u16.to_le_bytes());
-        sparse.extend_from_slice(&num_blks.to_le_bytes());
-        let total_sz = 12 + raw_payload.len() as u32;
-        sparse.extend_from_slice(&total_sz.to_le_bytes());
+        // Emit one 4 KiB RAW chunk per block, matching Samsung's super.img layout
+        // where chunk 0 holds 0x0000..0x0fff and chunk 1 starts at 0x1000.
+        for chunk in chunks {
+            sparse.extend_from_slice(&CHUNK_RAW.to_le_bytes());
+            sparse.extend_from_slice(&0u16.to_le_bytes());
+            sparse.extend_from_slice(&1u32.to_le_bytes());
+            let total_sz = 12 + chunk.len() as u32;
+            sparse.extend_from_slice(&total_sz.to_le_bytes());
+            sparse.extend_from_slice(chunk);
+        }
 
-        sparse.extend_from_slice(raw_payload);
         sparse
     }
 
     #[test]
     fn test_inspect_super_used_size() {
-        let raw = build_test_raw_image(&[
-            (1000, LP_TARGET_TYPE_LINEAR, 2048),
-            (5000, LP_TARGET_TYPE_LINEAR, 10000), // end = 15000
-            (2000, 1, 20000),                     // ZERO extent (target_type != 0), ignored
-        ]);
+        // DDP super.img (e.g. SM-F968B) has non-zero super_used_size at 0x400
+        let ddp_raw = build_test_raw_image(26_779_384);
+        assert_eq!(inspect_super_bytes(&ddp_raw), Some(26_779_384));
 
-        // Raw unsparse format
-        assert_eq!(inspect_super_bytes(&raw), Some(15000));
+        let ddp_sparse = build_test_sparse_image(&ddp_raw);
+        assert_eq!(inspect_super_bytes(&ddp_sparse), Some(26_779_384));
 
-        // Android sparse format
-        let sparse = build_test_sparse_image(&raw);
-        assert_eq!(inspect_super_bytes(&sparse), Some(15000));
+        // Non-DDP super.img (e.g. SM-P610 or AOSP lpmake) has 0 at 0x400
+        let non_ddp_raw = build_test_raw_image(0);
+        assert_eq!(inspect_super_bytes(&non_ddp_raw), None);
+
+        let non_ddp_sparse = build_test_sparse_image(&non_ddp_raw);
+        assert_eq!(inspect_super_bytes(&non_ddp_sparse), None);
     }
 }

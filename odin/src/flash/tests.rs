@@ -211,6 +211,56 @@ fn test_execute_skipping_super_skips_super_size_check() {
     assert!(run(&["super.img"]).is_ok());
 }
 
+#[test]
+fn test_execute_super_size_check_with_ddp_and_non_ddp_super_images() {
+    let non_ddp_super = crate::firmware::lp::tests::build_test_raw_image(0);
+    let ddp_super = crate::firmware::lp::tests::build_test_raw_image(26_779_384);
+
+    // The device rejects the super size check, so a flash only succeeds without it
+    let run = |packages: &[(&str, &[u8])], partitions: &[(&str, &[u8])]| {
+        let tar_bytes = build_tar(packages);
+        futures::executor::block_on(async {
+            let mut session = mock_session(
+                MockBackend::new()
+                    .with_protocol_version(3)
+                    .with_fail_check_super_size(-1),
+            )
+            .await;
+            let packages = (!packages.is_empty()).then(|| ("AP.tar", Cursor::new(&tar_bytes[..])));
+            FlashRequest::new()
+                .packages(packages)
+                .partitions(
+                    partitions.iter().map(|&(name, data)| {
+                        (Some(name.to_string()), "super.img", Cursor::new(data))
+                    }),
+                )
+                .run(&mut session)
+                .await
+        })
+    };
+
+    // Package without super_used_size.txt never inspects its super.img, even if the
+    // image itself has a DDP header
+    assert!(run(&[("super.img", &non_ddp_super)], &[]).is_ok());
+    assert!(run(&[("super.img", &ddp_super)], &[]).is_ok());
+
+    // Standalone non-DDP super.img (offset 0x400 == 0, e.g. SM-P610) sends no 0x6a check
+    assert!(run(&[], &[("SUPER", &non_ddp_super)]).is_ok());
+
+    // Package with super_used_size.txt or standalone DDP super.img (offset 0x400 > 0) sends 0x6a
+    let res = run(
+        &[
+            ("meta-data/super_used_size.txt", b"26779384\n"),
+            ("super.img", &non_ddp_super),
+        ],
+        &[],
+    );
+    assert!(matches!(res, Err(FlashError::SuperSizeCheckFailed(_))));
+
+    let res = run(&[], &[("SUPER", &ddp_super)]);
+    assert!(matches!(res, Err(FlashError::SuperSizeCheckFailed(_))));
+}
+
 fn rewrite_vbmeta(
     pit_data: &PitData,
     partitions: Vec<Cursor<Vec<u8>>>,
@@ -964,9 +1014,9 @@ fn test_prepare_rejects_invalid_inputs() {
 
 #[test]
 fn test_prepare_inspects_super_images() {
-    let super_img = crate::firmware::lp::tests::build_test_raw_image(&[(2048, 0, 4096)]);
+    let super_img = crate::firmware::lp::tests::build_test_raw_image(6144);
     let expected = crate::firmware::lp::inspect_super_bytes(&super_img);
-    assert!(expected.is_some());
+    assert_eq!(expected, Some(6144));
 
     let tar_bytes = build_tar(&[("super.img", &super_img)]);
     let prepared = futures::executor::block_on(
@@ -984,27 +1034,42 @@ fn test_prepare_inspects_super_images() {
     )
     .unwrap();
     let sizes: Vec<_> = prepared.images.iter().map(|i| i.super_used_size).collect();
-    // Partition IDs cannot be identified as super without a PIT
-    assert_eq!(sizes, [expected, expected, None]);
+    // Package super.img is never inspected; partition IDs cannot be identified as super without a PIT
+    assert_eq!(sizes, [None, expected, None]);
 
-    // super_used_size.txt takes precedence over inspecting images
+    // super_used_size.txt takes precedence over inspecting package images,
+    // while standalone super images are still inspected to allow overrides
+    let override_img = crate::firmware::lp::tests::build_test_raw_image(9999);
     let tar_bytes = build_tar(&[
         ("meta-data/super_used_size.txt", b"123\n"),
         ("super.img", &super_img),
     ]);
-    let prepared = futures::executor::block_on(
+    let mut prepared = futures::executor::block_on(
         FlashRequest::new()
             .packages([("AP.tar", Cursor::new(tar_bytes.as_slice()))])
+            .partitions([(
+                Some("SUPER".to_string()),
+                "override.img",
+                Cursor::new(&override_img[..]),
+            )])
             .prepare(),
     )
     .unwrap();
     assert_eq!(prepared.super_used_size, Some(123));
     assert_eq!(prepared.images[0].super_used_size, None);
+    assert_eq!(prepared.images[1].super_used_size, Some(9999));
+
+    let pit_data = ab_pit_data();
+    let plan = futures::executor::block_on(prepared.resolve(&pit_data, true)).unwrap();
+    assert_eq!(
+        futures::executor::block_on(prepared.super_used_size(&plan)),
+        Some(9999)
+    );
 }
 
 #[test]
 fn test_super_used_size_inspects_partition_id_targets() {
-    let super_img = crate::firmware::lp::tests::build_test_raw_image(&[(2048, 0, 4096)]);
+    let super_img = crate::firmware::lp::tests::build_test_raw_image(6144);
     let pit_data = ab_pit_data();
     let super_id = find_entry(&pit_data, "SUPER").partition_id;
 

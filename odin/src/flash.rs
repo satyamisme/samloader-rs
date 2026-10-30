@@ -241,10 +241,10 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashRe
     /// Reads and validates all inputs without a device or PIT.
     ///
     /// This verifies MD5 footers, indexes the packages, parses the LZ4 header of
-    /// every LZ4 compressed image, and inspects super images. A local PIT is
-    /// checked to be valid, but not used. The result only depends on the inputs
-    /// and options, as matching images to partitions, including skips, needs the
-    /// device's PIT and happens in [`PreparedFlash::execute`].
+    /// every LZ4 compressed image, and inspects standalone super images. A local
+    /// PIT is checked to be valid, but not used. The result only depends on the
+    /// inputs and options, as matching images to partitions, including skips,
+    /// needs the device's PIT and happens in [`PreparedFlash::execute`].
     pub async fn prepare(self) -> Result<PreparedFlash<P, I>, FlashError> {
         let Self {
             options,
@@ -321,18 +321,17 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> FlashRe
             let image = FirmwareImage::inspect(source, is_lz4, &mut readers)
                 .await
                 .map_err(|e| FlashError::Lz4Header(display_name.clone(), e))?;
+            let super_used_size = if target.is_super() {
+                image.super_used_size(&mut readers).await
+            } else {
+                None
+            };
             images.push(PlannedImage {
                 target,
                 display_name,
                 image,
-                super_used_size: None,
+                super_used_size,
             });
-        }
-
-        if index.super_used_size.is_none() {
-            for planned in images.iter_mut().filter(|i| i.target.is_super()) {
-                planned.super_used_size = planned.image.super_used_size(&mut readers).await;
-            }
         }
 
         Ok(PreparedFlash {
@@ -698,27 +697,34 @@ impl<P: AsyncRead + AsyncSeek + Unpin, I: AsyncRead + AsyncSeek + Unpin> Prepare
         Ok(())
     }
 
-    /// Determines the super partition size to check against the device. The value
-    /// from `super_used_size.txt` takes precedence over inspecting the super image.
+    /// Determines the super partition size to check against the device.
+    ///
+    /// Package super images rely exclusively on `super_used_size.txt` and are
+    /// never inspected. When the resolved `SUPER` payload is an explicit
+    /// standalone image, its own DDP header is used instead.
     async fn super_used_size(&mut self, plan: &FlashPlan<'_>) -> Option<u32> {
         if plan.super_skipped {
             return None;
         }
-        if self.super_used_size.is_some() {
-            return self.super_used_size;
-        }
 
-        let (payload, &index) = plan
+        let super_payload = plan
             .payloads
             .iter()
             .zip(&plan.image_indices)
-            .find(|(payload, _)| payload.pit_entry.is_super())?;
-        let planned = &self.images[index];
-        if planned.target.is_super() {
-            // Already inspected while preparing
-            return planned.super_used_size;
+            .find(|(payload, _)| payload.pit_entry.is_super());
+
+        if let Some((payload, &index)) = super_payload {
+            let planned = &self.images[index];
+            if planned.is_standalone() {
+                if planned.target.is_super() {
+                    // Already inspected while preparing
+                    return planned.super_used_size;
+                }
+                return payload.image.super_used_size(&mut self.readers).await;
+            }
         }
-        payload.image.super_used_size(&mut self.readers).await
+
+        self.super_used_size
     }
 
     /// Flashes resolved payloads to the device, then ends the session and reboots
